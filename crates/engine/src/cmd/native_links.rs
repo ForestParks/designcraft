@@ -59,9 +59,13 @@ fn require_originals(doc: &Document) -> Result<()> {
 /// Serialize for a known destination. Only the saved clone gets relative paths; Save As and
 /// Save a Copy must not rebase the live document or its undo history.
 pub(super) fn save(doc: &Document, destination: &Path) -> Result<Vec<u8>> {
+    save_with_preview(doc, destination, None)
+}
+
+pub(super) fn save_with_preview(doc: &Document, destination: &Path, preview: Option<&[u8]>) -> Result<Vec<u8>> {
     let mut saved = doc.clone();
     rebase(&mut saved, destination)?;
-    designcraft_format::save_working(&saved).map_err(|e| EngineError::Other(e.to_string()))
+    designcraft_format::save_working_with_preview(&saved, preview).map_err(|e| EngineError::Other(e.to_string()))
 }
 
 fn rebase(saved: &mut Document, destination: &Path) -> Result<()> {
@@ -166,6 +170,8 @@ fn install_graphic(asset: &mut designcraft_doc::Asset, bytes: Arc<Vec<u8>>) -> s
     // metadata refresh so the Links panel's effective resolution describes the loaded file.
     asset.pixels = Some(pixels.ok_or("linked artwork is corrupt or its selected PDF page is unavailable")?);
     asset.data = bytes;
+    // The source can change while closed; a stored PDF crop belongs to the previous bytes.
+    super::file::crop_pdf(asset);
     Ok(())
 }
 

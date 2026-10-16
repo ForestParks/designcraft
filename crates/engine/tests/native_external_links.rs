@@ -274,3 +274,47 @@ fn choosing_a_baseline_explicitly_adopts_current_metrics_and_undo_restores_legac
     session.execute("edit.undo", &json!({})).unwrap();
     assert!(session.doc().unwrap().doc.item(id).unwrap().text_frame().unwrap().options.legacy_first_baseline);
 }
+
+#[test]
+fn linked_save_keeps_recent_preview_and_normalized_extension() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut session, _, _) = setup(temp.path());
+    let requested = temp.path().join("linked-working");
+    let written = temp.path().join("linked-working.designcraft");
+    let result = session.execute("file.saveAs", &json!({"path": requested, "embedImages": false})).unwrap();
+    assert_eq!(result["path"], written.to_str().unwrap());
+    assert_eq!(assets(&written), 0);
+    let preview = designcraft_format::read_preview(std::fs::File::open(&written).unwrap()).unwrap();
+    assert!(preview.starts_with(b"\x89PNG"), "linked files retain the upstream recent-file preview");
+    let copy = session.execute("file.saveACopy", &json!({"path": temp.path().join("copy")})).unwrap();
+    let copy = Path::new(copy["path"].as_str().unwrap());
+    assert_eq!(assets(copy), 0);
+    assert!(designcraft_format::read_preview(std::fs::File::open(copy).unwrap()).is_some());
+    let mut reopened = Session::new();
+    reopened.execute("file.open", &json!({"path": copy})).unwrap();
+    assert_eq!(reopened.execute("links.list", &json!({})).unwrap()[0]["status"], "ok");
+}
+
+#[test]
+fn changed_external_pdf_recalculates_its_saved_crop() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source.pdf");
+    let mut origin = Session::new();
+    origin.execute("file.new", &json!({})).unwrap();
+    origin.execute("layout.documentSetup", &json!({"bleed": 9})).unwrap();
+    origin.execute("file.exportPdf", &json!({"path": source, "bleed": true})).unwrap();
+    let mut session = Session::new();
+    session.execute("file.new", &json!({})).unwrap();
+    session.execute("file.place", &json!({"path": source, "pdfCrop": "trim", "width": 315})).unwrap();
+    let before = session.doc().unwrap().doc.assets.values().next().unwrap().pdf_box.unwrap();
+    let path = temp.path().join("layout.designcraft");
+    session.execute("file.saveAs", &json!({"path": path, "embedImages": false})).unwrap();
+    origin.execute("layout.documentSetup", &json!({"bleed": 18})).unwrap();
+    origin.execute("file.exportPdf", &json!({"path": source, "bleed": true})).unwrap();
+    let mut reopened = Session::new();
+    reopened.execute("file.open", &json!({"path": path})).unwrap();
+    let asset = reopened.doc().unwrap().doc.assets.values().next().unwrap();
+    let expected = designcraft_render::pdf_crop_box(&asset.data, asset.page as usize, asset.pdf_crop).unwrap().0;
+    assert_ne!(before, expected);
+    assert_eq!(asset.pdf_box, Some(expected), "the cached crop belongs to the new source bytes");
+}

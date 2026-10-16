@@ -26,10 +26,14 @@ The next `file.save` remembers that choice. `embedImages:true` switches back to 
 linked originals; `links.storage {"mode":"embedded"}` does the same. `file.saveACopy` accepts
 the option without changing the open document's mode, path or saved state.
 
+Working saves retain the first-page picture used by Recent Files. Save and Save a Copy add the
+`.designcraft` extension when it is missing, including when linked storage is selected.
+
 Source paths are stored relative to the working document where possible, so moving the layout
 and its `Links/` folder together keeps them connected. Opening a native file loads its linked
 originals into memory for editing and full-resolution export. Changes to a source during the
 session still appear as Modified in the Links panel and can be accepted with Update.
+Reopening a changed linked PDF recalculates its saved crop box from the new source bytes.
 
 If an original cannot be found when opening, the layout opens with a warning and the missing
 link can be relinked. There is no saved preview for unresolved artwork in this first version.
