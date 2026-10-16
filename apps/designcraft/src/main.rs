@@ -268,6 +268,10 @@ fn main() -> eframe::Result {
         }
     }
     let mut options = eframe::NativeOptions {
+        // Finish inside the event loop on macOS. Returning through AppKit after the last
+        // window is destroyed can invalidate a stale Touch Bar observer and abort the
+        // process. eframe still saves and calls on_exit before terminating this loop.
+        run_and_return: !cfg!(target_os = "macos"),
         viewport: egui::ViewportBuilder::default()
             .with_title("DesignCraft")
             .with_inner_size([1440.0, 900.0])
@@ -335,6 +339,7 @@ fn main() -> eframe::Result {
             session.recovery_dir = profile::recovery_dir();
             let recovered = session.execute("file.recovery.open", &serde_json::json!({})).ok();
             let mut app = DesignApp::new(session, services());
+            designcraft_render::images::set_preview_directory(if no_prefs() { None } else { profile::config_dir().map(|d| d.join("Previews")) });
             if let Some(line) = gpu.as_ref().and_then(gpu::Startup::status_line) {
                 app.status(line);
             }

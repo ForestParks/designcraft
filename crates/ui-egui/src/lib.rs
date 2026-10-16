@@ -8,12 +8,14 @@
 
 pub mod about;
 pub mod canvas;
+mod canvas_preview;
 pub mod chrome;
 pub mod control;
 pub mod credits;
 pub mod cursors;
 pub mod dialogs;
 pub mod dock;
+mod drag_preview;
 pub mod i18n;
 pub mod icons;
 pub mod menus;
@@ -26,6 +28,7 @@ mod rtl;
 pub mod story_editor;
 pub mod taskbar;
 pub mod theme;
+mod thumbnails;
 pub mod toolbar;
 pub mod widgets;
 
@@ -463,6 +466,11 @@ impl CanvasCache {
             pending_doc: None,
             patcher: designcraft_render::Renderer::new(),
             patches: 0,
+            drag: Default::default(),
+            previews: Default::default(),
+            drag_active: false,
+            defer_full: false,
+            low_quality: false,
         }
     }
 }
@@ -492,6 +500,11 @@ pub struct CanvasCache {
     pub patcher: designcraft_render::Renderer,
     /// Partial repaints / full renders since start (perf readout).
     pub patches: u64,
+    pub(crate) drag: crate::drag_preview::Preview,
+    pub(crate) previews: crate::canvas_preview::Previews,
+    pub(crate) drag_active: bool,
+    pub(crate) defer_full: bool,
+    pub(crate) low_quality: bool,
 }
 
 #[derive(Default, Clone, Copy, Debug, Serialize)]
@@ -524,6 +537,7 @@ pub struct DesignApp {
     /// The persisted colour settings have been applied this session.
     pub color_applied: bool,
     pub perf: Perf,
+    pub(crate) thumbnails: thumbnails::Thumbnails,
     pub synthetic: Vec<egui::Event>,
     /// Control input stays separate from native-menu input until its frame is processed.
     pub(crate) control_synthetic: Vec<egui::Event>,
@@ -596,6 +610,7 @@ impl DesignApp {
             power_zoom: None,
             color_applied: false,
             perf: Perf::default(),
+            thumbnails: Default::default(),
             synthetic: vec![],
             control_synthetic: vec![],
             control_input_frame: Default::default(),
@@ -780,7 +795,7 @@ impl DesignApp {
                 }
             }
             // Release only when the request actually replaces Find, including a native PDF picker.
-            if was_find && !self.ui.dialog.as_ref().is_some_and(|d| d.id == "findChange") {
+            if was_find && self.ui.dialog.as_ref().is_none_or(|d| d.id != "findChange") {
                 self.session.reset_find_scope();
             }
         }
@@ -914,6 +929,19 @@ impl DesignApp {
 
     /// Per-frame logic before layout.
     pub fn logic(&mut self, ctx: &egui::Context) {
+        self.thumbnails.retain_open(self.session.documents().iter().any(|d| d.uid == self.thumbnails.document_uid()));
+        self.canvas.previews.retain_open(self.session.documents().iter().any(|d| d.uid == self.canvas.previews.document_uid()));
+        if let Some((canvas, _)) = &mut self.other_pane {
+            canvas.previews.retain_open(self.session.documents().iter().any(|d| d.uid == canvas.previews.document_uid()));
+        }
+        if self.session.active().is_none() {
+            self.canvas.drag.clear();
+            self.canvas.previews.clear();
+            if let Some((canvas, _)) = &mut self.other_pane {
+                canvas.drag.clear();
+                canvas.previews.clear();
+            }
+        }
         if self.egui_ctx.is_none() {
             self.egui_ctx = Some(ctx.clone());
         }

@@ -1,46 +1,10 @@
 //! Pages panel: parents at the top, document spreads with live thumbnails below.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
-
 use egui::{Color32, Sense, Stroke, StrokeKind, vec2};
 use serde_json::json;
 
 use crate::theme::Tokens;
 use crate::{DesignApp, icons};
-
-type ThumbKey = (u64, u64, usize);
-
-static THUMBS: Mutex<Option<HashMap<ThumbKey, egui::TextureHandle>>> = Mutex::new(None);
-
-fn thumb(app: &mut DesignApp, ctx: &egui::Context, abs: usize, h: f32) -> Option<egui::TextureHandle> {
-    let st = app.session.active()?;
-    let key = (st.uid, st.revision, abs);
-    let mut g = THUMBS.lock().unwrap_or_else(|e| e.into_inner());
-    let map = g.get_or_insert_with(HashMap::new);
-    if let Some(t) = map.get(&key) {
-        return Some(t.clone());
-    }
-    let page = st.doc.page(abs)?;
-    let scale = (h as f64 * ctx.pixels_per_point() as f64) / page.height;
-    let mut r = designcraft_render::Renderer::new();
-    r.threads = 0;
-    let img = r.render_page(
-        &st.doc,
-        &app.session.cache,
-        abs,
-        scale,
-        false,
-        &designcraft_render::RenderOptions { printing_only: true, ..Default::default() },
-    )?;
-    let ci = egui::ColorImage::from_rgba_premultiplied([img.width as usize, img.height as usize], &img.pixels);
-    let tex = crate::widgets::load_texture(ctx, format!("thumb{abs}"), ci, egui::TextureOptions::LINEAR);
-    // Drop thumbnails of older revisions.
-    let (uid, rev) = (st.uid, st.revision);
-    map.retain(|k, _| !(k.0 == uid && k.1 != rev));
-    map.insert(key, tex.clone());
-    Some(tex)
-}
 
 /// What is being dragged in the Pages panel.
 #[derive(Clone, Debug, PartialEq)]
@@ -76,6 +40,12 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     let Some(st) = app.session.active() else { return };
     let doc = st.doc.clone();
+    let interacting = st.interaction.is_some();
+    // Keep existing thumbnails while dragging. Intermediate preview documents must not start
+    // new page renders or evict thumbnails on every mouse movement; commit invalidates once.
+    if !interacting {
+        app.thumbnails.begin(st.uid, st.revision, doc.clone(), ui.ctx());
+    }
     let editing_parents = st.editing_parents;
     let aspect = (doc.settings.page_width / doc.settings.page_height.max(1.0)) as f32;
     let mut drop: Option<(PageDrag, usize)> = None;
@@ -137,7 +107,9 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
             let resp = ui.interact(pr, ui.id().with(("page", abs)), Sense::click_and_drag());
             let selected = abs == cur && !editing_parents;
             let tint = if selected { SELECTED_TINT } else { Color32::WHITE };
-            if let Some(tex) = thumb(app, ui.ctx(), abs, THUMB_H) {
+            if ui.is_rect_visible(pr)
+                && let Some(tex) = app.thumbnails.get(abs, (THUMB_H * ui.ctx().pixels_per_point()).round() as u32)
+            {
                 ui.painter().image(tex.id(), pr, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), tint);
             } else {
                 ui.painter().rect_filled(pr, 0.0, tint);
@@ -187,6 +159,9 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
             }
             ui.painter().galley(c - g.size() / 2.0, g, Color32::WHITE);
         }
+    }
+    if app.canvas.shown.is_some() && app.canvas.pending.is_none() && !interacting {
+        app.thumbnails.finish(ui.ctx(), app.session.cache.clone(), cur);
     }
     ui.add_space(6.0);
     ui.spacing_mut().item_spacing.y = 4.0;

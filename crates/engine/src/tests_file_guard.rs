@@ -23,6 +23,10 @@ const ALLOWED: &[(&str, &str)] = &[
     ("engine/src/file_access.rs", "the root check itself (resolves links with the file system)"),
     ("engine/src/atomic.rs", "how a write reaches the disk; commands call it only through io::write_file and io::replace_with"),
     (
+        "render/src/preview_disk.rs",
+        "disposable bounded previews in a directory explicitly configured by the native host; filenames are content hashes, never document-supplied paths. CLI and web leave persistence disabled",
+    ),
+    (
         "engine/src/recovery.rs",
         "the unsaved documents live in a folder the host application chooses (a command's own `dir` is checked in cmd/file.rs before it gets here)",
     ),
@@ -158,7 +162,7 @@ fn offenders(crates_dir: &Path) -> (Vec<String>, usize) {
     for path in files {
         let rel = path.strip_prefix(crates_dir).unwrap_or(&path).to_string_lossy().replace('\\', "/");
         // `crates/<name>/src/...` only: build scripts, benches and `tests/` are not shipped code.
-        if !rel.split('/').nth(1).is_some_and(|d| d == "src") || is_test_file(&rel) || ALLOWED.iter().any(|(allowed, _)| *allowed == rel) {
+        if rel.split('/').nth(1).is_none_or(|d| d != "src") || is_test_file(&rel) || ALLOWED.iter().any(|(allowed, _)| *allowed == rel) {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(&path) else { continue };
