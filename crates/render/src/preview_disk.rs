@@ -69,7 +69,8 @@ fn path(bytes: &Arc<Vec<u8>>, page: u32, level: u8) -> Option<PathBuf> {
         }
         hash
     });
-    Some(directory.join(format!("v2-{}-{hash}-{page}-{level}.dcpreview", renderer_tag())))
+    let colour = format!("{:x}", Sha256::digest(format!("{:?}", designcraft_color::cms::active_settings()).as_bytes()));
+    Some(directory.join(format!("v3-{}-{colour}-{hash}-{page}-{level}.dcpreview", renderer_tag())))
 }
 
 pub(super) fn load(bytes: &Arc<Vec<u8>>, page: u32, level: u8, size: (u32, u32)) -> Option<Pixmap> {

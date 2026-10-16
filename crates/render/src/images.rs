@@ -46,6 +46,8 @@ struct Cache {
     /// Value: (insertion stamp, the encoded bytes keeping the address reserved).
     bad: HashMap<(usize, u32), (u64, Weak<Vec<u8>>)>,
     stats: Stats,
+    /// The colour settings the pixels were converted with ([`designcraft_color::cms::generation`]).
+    colour: u64,
 }
 
 impl Cache {
@@ -70,7 +72,13 @@ fn size_of(pm: &Pixmap) -> usize {
 
 fn with<R>(f: impl FnOnce(&mut Cache) -> R) -> R {
     let mut g = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    f(g.get_or_insert_with(Cache::default))
+    let c = g.get_or_insert_with(Cache::default);
+    // Decoding converts CMYK through the working space: new colour settings, new pixels.
+    let colour = designcraft_color::cms::generation();
+    if c.colour != colour {
+        *c = Cache { clock: c.clock, colour, ..Cache::default() };
+    }
+    f(c)
 }
 
 fn lookup(key: Key) -> Option<Arc<Pixmap>> {

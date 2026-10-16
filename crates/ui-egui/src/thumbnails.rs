@@ -72,6 +72,7 @@ impl Worker {
 pub(crate) struct Thumbnails {
     uid: u64,
     revision: u64,
+    colour: u64,
     generation: u64,
     doc: Option<Arc<Document>>,
     textures: HashMap<Key, (TextureHandle, u64)>,
@@ -126,14 +127,21 @@ impl Thumbnails {
     pub fn begin(&mut self, uid: u64, revision: u64, doc: Arc<Document>, ctx: &egui::Context) {
         #[cfg(target_arch = "wasm32")]
         let _ = ctx;
-        if self.doc.is_none() || uid != self.uid || revision != self.revision || self.doc.as_ref().is_some_and(|old| !Arc::ptr_eq(old, &doc)) {
-            let keep = if self.uid == uid { self.doc.as_ref().and_then(|old| affected(old, &doc)) } else { None };
+        let colour = designcraft_color::cms::generation();
+        if self.doc.is_none()
+            || uid != self.uid
+            || revision != self.revision
+            || colour != self.colour
+            || self.doc.as_ref().is_some_and(|old| !Arc::ptr_eq(old, &doc))
+        {
+            let keep = if self.uid == uid && self.colour == colour { self.doc.as_ref().and_then(|old| affected(old, &doc)) } else { None };
             self.textures.retain(|key, _| keep.as_ref().is_some_and(|pages| !pages.contains(&key.page)));
             self.reused = self.reused.saturating_add(self.textures.len() as u64);
             self.failed.clear();
             self.generation = self.generation.wrapping_add(1);
             self.uid = uid;
             self.revision = revision;
+            self.colour = colour;
             self.doc = Some(doc);
         }
         self.requested.clear();
@@ -233,5 +241,15 @@ mod tests {
         thumbs.accept(Done { generation: 2, key: Key { page: 0, height: 37 }, image: None }, &ctx);
         assert!(!thumbs.pending);
         assert!(thumbs.failed.is_empty());
+    }
+    #[test]
+    fn page_thumbnail_renders_at_each_requested_panel_size() {
+        let doc = Arc::new(Document::new(&NewDocument { width: 200.0, height: 100.0, facing_pages: false, ..Default::default() }));
+        for height in [24, 37, 55, 120] {
+            let done = render(Job { generation: 1, key: Key { page: 0, height }, doc: doc.clone(), cache: Arc::new(Cache::new()) });
+            let image = done.image.unwrap();
+            assert_eq!((image.width, image.height), (height * 2, height));
+            assert_eq!(image.pixel(height, height / 2), [255, 255, 255, 255]);
+        }
     }
 }

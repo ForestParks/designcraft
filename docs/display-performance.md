@@ -13,7 +13,7 @@ files are not kept alive by the image cache.
 
 On desktop, disposable raster/PDF previews live in the profile's `Previews` directory (including
 isolated `DESIGNCRAFT_CONFIG_DIR` profiles). Cache keys contain a version, SHA-256 of original
-bytes, PDF-page index and mip level. A renderer/dependency fingerprint invalidates previews
+bytes, PDF-page index, mip level and active colour settings. A renderer/dependency fingerprint invalidates previews
 when decoding code or pinned dependencies change, including development builds. Preview files preserve premultiplied pixels exactly and
 have checksums; corrupt, missing or unwritable caches fall back to originals. The disk budget
 is 512 MiB. PDF dimensions come from the pinned rasterizer without drawing the page, so cached PDF
@@ -25,6 +25,9 @@ pages closest to the current page. Old revision results cannot replace new thumb
 changes invalidate the affected spreads; global styles, parents, page structures and asset
 changes conservatively refresh all. Browser/no-thread fallback renders at most one thumbnail
 per frame. A source replacement gets new preview keys automatically.
+Document-page thumbnails follow the Pages panel's size and Show Thumbnails options; only
+visible document rows request background rendering. Colour-setting changes invalidate decoded
+image pixels and document-page thumbnail textures.
 
 This is demand loading of **decoded pixels**. Native linked documents still read and retain
 encoded original files on opening, so source status, export, packaging, undo and self-contained
@@ -45,7 +48,7 @@ not rewrite the artwork or replace its original bytes. Snapping and frame overla
 engine geometry; commit/cancel/undo use the existing interaction transaction.
 
 Backdrop-dependent effects, non-normal blends, live text wrap and nested/copy/cross-spread
-moves cannot use the three-layer shortcut. Compatible small changes keep full-quality partial
+moves, or an active document grid, cannot use the three-layer shortcut. Compatible small changes keep full-quality partial
 redraws. Large or unbounded changes, proof/ink-limit views and the browser's no-thread path
 use a reduced-resolution canvas when a complete repaint is needed during the interaction.
 Full-quality pixels are restored after release, asynchronously on native views. This affects
@@ -88,3 +91,5 @@ Typical Display resolution until sharp pixels arrive. Fast Display keeps its int
 visual checks, the `ui_shot` example accepts `{"holdSharpCanvas":true}` after a sharp frame has
 rendered, retaining the old texture as if a viewport render were delayed. Set it to false to
 resume rendering. This is a test-harness control, not a product option.
+
+A canvas already sampled down to the GPU texture limit is reused at rest; its expected pixel size uses the same fitting calculation as upload. Edits still reject full-resolution partial uploads into a reduced texture and repaint it whole.

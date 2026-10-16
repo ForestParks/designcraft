@@ -329,13 +329,16 @@ mod tests {
         doc.settings.blend_space = designcraft_doc::BlendSpace::Rgb;
         let aid = AssetId(doc.alloc());
         doc.assets.insert(aid,Arc::new(Asset {id:aid,name:"synthetic drag graphic".into(),mime:"image/svg+xml".into(),link:None,
-            data:Arc::new(br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><rect width="100" height="100" fill="red" fill-opacity="0.5"/></svg>"#.to_vec()),pixels:Some((100,100)),page:0}));
+            data:Arc::new(br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><rect width="100" height="100" fill="red" fill-opacity="0.5"/></svg>"#.to_vec()),pixels:Some((100,100)),page:0,..Default::default()}));
         let id = ItemId(doc.alloc());
         let mut it = Item::new(id, doc.default_layer(), Shape::Rectangle, shapes::rectangle(Rect::new(30.0, 30.0, 230.0, 170.0)));
         it.content = Content::Graphic(Graphic {
             asset: aid,
             size: (300.0, 300.0),
             xf: Affine::translate((-20.0, -30.0)),
+            clip: None,
+            wrap: Default::default(),
+            fill: Default::default(),
             auto_fit: Default::default(),
             fit_align: 4,
             crop: [10.0, 20.0, 30.0, 40.0],
