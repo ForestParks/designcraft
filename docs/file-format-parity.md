@@ -1,6 +1,6 @@
 # File format parity
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-13 · **Change:** minor (content-indexed asset deduplication, #727) · **Target:** Adobe InDesign 2026 (21.6)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-14 · **Change:** minor (opt-in linked-only native working files, #856) · **Target:** Adobe InDesign 2026 (21.6)
 
 Every format InDesign 2026 reads or writes, with DesignCraft's support, fidelity and tests. The
 InDesign list comes from its bundle's `Info.plist` (`CFBundleDocumentTypes`,
@@ -109,3 +109,14 @@ for real work** (estimated). INDD alone moves this dimension by up to 30 points.
 |---|---|---|
 | 2026-10-13 | minor | Asset loading and compaction use content fingerprints with exact equality checks; tests cover equal-sized distinct buffers, shared copies, independent links and missing data (#727) |
 | 2026-10-10 | major | Created from InDesign 2026's declared document types and filters, `plan/indesign/08-file-formats.md` and the code |
+
+## Linked native artwork (2026-10-14)
+
+Native working files can keep linked originals external through the Links panel or
+`file.save {embedImages:false}`. Embedded storage remains the default for existing documents;
+recovery and byte serialization retain originals. See [linked-artwork.md](linked-artwork.md).
+This adds external storage; cached editing data is still loaded in memory, and missing links
+do not yet have saved previews.
+
+Native format 1 text frames now preserve ascent-derived first-baseline offsets. Files retaining
+these compatibility settings use native format 4 so earlier readers reject them safely.

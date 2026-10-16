@@ -1,9 +1,9 @@
 //! Window › Links: placed graphics with their status, effective resolution and uses; relink,
 //! update, embed, go to.
 //!
-//! Every placed graphic keeps its bytes in the document; a linked graphic also remembers its
-//! file. Its status compares that file with the copy in the document: missing, modified (the
-//! file's bytes differ) or OK.
+//! Originals stay cached in the live document. Native working files can store links only;
+//! portable serialization and recovery always retain the originals. Link status compares the
+//! source file with the cached copy: missing, modified (the bytes differ) or OK.
 //!
 //! A linked text file (File › Place with Create Links) remembers its file's size and hash on the
 //! story instead; updating it imports the file again into the story.
@@ -18,6 +18,15 @@ use crate::{EngineError, Result, Session};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
+        cmd!(
+            "links.storage",
+            "Linked Artwork Storage",
+            [],
+            None,
+            "{mode?: linked|embedded} — native working saves keep linked originals external or include them; no mode reports the document's choice",
+            has_doc,
+            super::native_links::storage
+        ),
         cmd!(query "links.list", "Links", [], None, "{} → [{asset, name, path, status: ok|modified|missing|embedded, pixels, uses: [{id, page, ppi}]}], then linked text files: [{story, name, path, status (also tooLarge: unchanged size, too big to check), edited (the story was changed in the layout), uses: [{id, page}]}]", has_doc, |s, _| {
             let d = s.doc()?.doc.clone();
             Ok(Value::Array(list(&d, &mut s.text_link_checks)))
@@ -66,6 +75,9 @@ pub fn specs() -> Vec<CommandSpec> {
                 let aid = asset_param(p, "links.embed")?;
                 s.edit(|d, _| {
                     let a = d.assets.get_mut(&aid).ok_or_else(|| bad("links.embed", "no such graphic"))?;
+                    if a.data.is_empty() {
+                        return Err(bad("links.embed", "relink the missing artwork before embedding it"));
+                    }
                     Arc::make_mut(a).link = None;
                     Ok(Value::Null)
                 })

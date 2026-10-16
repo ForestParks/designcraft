@@ -21,13 +21,14 @@ pub fn specs() -> Vec<CommandSpec> {
             "{path} — .designcraft or .idml; the fonts in a `Document Fonts` folder beside it load first → {index, documentFonts: faces loaded, warnings: font files skipped (and, for .idml, package parts missing)}",
             always, file_open),
         cmd!(noundo "file.openBytes", "Open Bytes", [], None, "{name, base64} — DesignCraft JSON or an IDML package", always, file_open_bytes),
-        cmd!(noundo "file.save", "Save", ["File"], Some("Cmd+S"), "{path?}", has_doc, file_save),
-        cmd!(noundo "file.saveAs", "Save As…", ["File"], Some("Cmd+Shift+S"), "{path}", has_doc, file_save),
-        cmd!(noundo "file.saveACopy", "Save a Copy…", ["File"], None, "{path} — writes the document without changing which file it is or its unsaved state", has_doc, |s, p| {
+        cmd!(noundo "file.save", "Save", ["File"], Some("Cmd+S"), "{path?, embedImages?: bool} — false keeps linked artwork external; the choice is remembered for later saves", has_doc, file_save),
+        cmd!(noundo "file.saveAs", "Save As…", ["File"], Some("Cmd+Shift+S"), "{path, embedImages?: bool}", has_doc, file_save),
+        cmd!(noundo "file.saveACopy", "Save a Copy…", ["File"], None, "{path, embedImages?: bool} — writes the document without changing which file it is or its unsaved state", has_doc, |s, p| {
             let path = str_param(p, "path").ok_or_else(|| bad("file.saveACopy", "missing `path`"))?.to_string();
             let mut copy = (*s.doc()?.doc).clone();
+            super::native_links::save_options(&mut copy, p)?;
             super::datamerge::refresh_relative_paths(&mut copy, std::path::Path::new(&path));
-            let bytes = to_bytes(&copy);
+            let bytes = super::native_links::save(&copy, std::path::Path::new(&path))?;
             #[cfg(not(target_arch = "wasm32"))]
             crate::io::write_file(&path, &bytes).map_err(EngineError::Other)?;
             Ok(json!({"path": path, "bytes": bytes.len()}))
@@ -183,9 +184,13 @@ fn file_open(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let bytes = crate::io::read_file(path).map_err(EngineError::Other)?;
         let mut d = from_bytes(&bytes)?;
-        super::interchange::resolve_packaged_links(&mut d, std::path::Path::new(path).parent());
+        let mut warnings = super::native_links::resolve(&mut d, Some(std::path::Path::new(path)));
+        if !d.settings.external_links {
+            super::interchange::resolve_packaged_links(&mut d, std::path::Path::new(path).parent());
+        }
         super::datamerge::resolve_sources_on_open(&mut d, Some(std::path::Path::new(path)));
-        let (fonts, faces, warnings) = load_document_fonts(&mut d, path);
+        let (fonts, faces, font_warnings) = load_document_fonts(&mut d, path);
+        warnings.extend(font_warnings);
         let mut st = DocState::new(d, Some(path.to_string()));
         st.fonts = fonts;
         let i = s.add_document(st);
@@ -250,12 +255,13 @@ fn file_open_bytes(s: &mut Session, p: &Value) -> Result<Value> {
         return super::interchange::open_idml(s, p);
     }
     let mut d = from_bytes(&b)?;
+    let warnings = super::native_links::resolve(&mut d, None);
     super::datamerge::resolve_sources_on_open(&mut d, None);
     if let Some(n) = str_param(p, "name") {
         d.title = n.to_string();
     }
     let i = s.add_document(DocState::new(d, None));
-    Ok(json!({"index": i}))
+    Ok(json!({"index": i, "warnings": warnings}))
 }
 
 fn file_save(s: &mut Session, p: &Value) -> Result<Value> {
@@ -268,10 +274,11 @@ fn file_save(s: &mut Session, p: &Value) -> Result<Value> {
     crate::file_access::check_write(&path).map_err(EngineError::Other)?;
     // Prepare paths for the destination without changing the live document until persistence succeeds.
     let mut saved = (*st.doc).clone();
+    super::native_links::save_options(&mut saved, p)?;
     super::datamerge::refresh_relative_paths(&mut saved, std::path::Path::new(&path));
-    let paths_changed = saved.data_merge != st.doc.data_merge;
+    let paths_changed = saved.data_merge != st.doc.data_merge || saved.settings.external_links != st.doc.settings.external_links;
     let saved = if paths_changed { Arc::new(saved) } else { st.doc.clone() };
-    let bytes = to_bytes(&saved);
+    let bytes = super::native_links::save(&saved, std::path::Path::new(&path))?;
     #[cfg(not(target_arch = "wasm32"))]
     crate::io::write_file(&path, &bytes).map_err(EngineError::Other)?;
     if paths_changed {
@@ -584,11 +591,15 @@ fn snippet_export(s: &mut Session, p: &Value) -> Result<Value> {
 /// 1-based) grouped, top-left at x/y (default: the source position on the first page).
 fn place_layout_page(s: &mut Session, p: &Value, name: &str, bytes: &[u8]) -> Result<Value> {
     const ID: &str = "file.place";
-    let src = if name.to_lowercase().ends_with(".idml") {
+    let mut src = if name.to_lowercase().ends_with(".idml") {
         super::interchange::import_idml_confined(bytes).map_err(|e| bad(ID, e.to_string()))?
     } else {
         from_bytes(bytes)?
     };
+    let warnings = super::native_links::resolve(&mut src, str_param(p, "path").map(std::path::Path::new));
+    if !warnings.is_empty() {
+        return Err(bad(ID, warnings.join("; ")));
+    }
     let n = src.page_count();
     let page = p.get("layoutPage").and_then(Value::as_u64).unwrap_or(1) as usize;
     if page == 0 || page > n {
@@ -714,6 +725,7 @@ fn file_revert(s: &mut Session, _: &Value) -> Result<Value> {
         } else {
             from_bytes(&crate::io::read_file(&path).map_err(EngineError::Other)?)?
         };
+        let warnings = super::native_links::resolve(&mut d, Some(std::path::Path::new(&path)));
         // As opened again: the fonts beside it now (unchanged files are shared, not read again).
         let (fonts, _, _) = load_document_fonts(&mut d, &path);
         let uid = s.doc()?.uid;
@@ -725,7 +737,7 @@ fn file_revert(s: &mut Session, _: &Value) -> Result<Value> {
         fresh.revision = s.doc()?.revision + 1;
         crate::recovery::discard_document(s, index, recovery_dir.as_deref());
         *s.doc_mut()? = fresh;
-        Ok(json!({"path": path}))
+        Ok(json!({"path": path, "warnings": warnings}))
     }
     #[cfg(target_arch = "wasm32")]
     {

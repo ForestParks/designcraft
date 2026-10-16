@@ -185,7 +185,9 @@ Kind: **F** feature · **U** UI/UX · **T** typography · **FF** file format · 
 - **Missing:** incremental composition (recompose from the edited paragraph; 8 ms keystroke
   budget), benchmarks against InDesign on long books and image-heavy catalogues.
 - **Have:** compose 300k characters ~38 ms warm, damage-region repaint (< 1 ms while typing),
-  parallel story composition.
+  parallel story composition. Image previews reuse cached mip levels before full decoding;
+  decoded artwork is bounded, and visible page thumbnails render in the background on native.
+  See [display performance](display-performance.md).
 - **Estimate:** 40–80 h.
 
 ### 26. Autoflow fills the following pages before it adds pages (F)
@@ -239,3 +241,10 @@ Cue. These are excluded from every percentage.
 | 2026-10-12 | minor | Gap 0 shrunk to the Primary Text Frame page fixes (#165): text threads by hand; gaps added for autoflow onto existing pages and threading into grouped frames |
 | 2026-10-10 | minor | Gap 0 added and marked alpha blocker: manual text threading is missing (stage re-normalized to pre-alpha) |
 | 2026-10-10 | major | Created: 25 ranked gaps from the full re-measure against InDesign 2026 21.6 and issues #1–#352 |
+
+## External native artwork follow-ups (#856)
+
+Opt-in linked-only working saves are implemented; see [linked-artwork.md](linked-artwork.md).
+Remaining: small persistent previews for missing sources, lazy-loading full-resolution artwork,
+and deciding whether new documents should default to external storage. Existing embedded files
+keep their behavior until the user explicitly changes the storage mode.

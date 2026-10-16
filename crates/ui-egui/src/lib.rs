@@ -780,7 +780,7 @@ impl DesignApp {
                 }
             }
             // Release only when the request actually replaces Find, including a native PDF picker.
-            if was_find && !self.ui.dialog.as_ref().is_some_and(|d| d.id == "findChange") {
+            if was_find && self.ui.dialog.as_ref().is_none_or(|d| d.id != "findChange") {
                 self.session.reset_find_scope();
             }
         }

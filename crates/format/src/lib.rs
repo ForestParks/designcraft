@@ -6,6 +6,10 @@
 //!   the ones the document references (see [`Document::compact_assets`])
 //! - `meta.json`: format version and generator
 //!
+//! Working saves in external-link mode omit linked originals and require format 3. Portable
+//! saves retain them; ordinary embedded documents remain format 2. Migrated legacy baseline
+//! settings require format 4. Loading never follows links.
+//!
 //! Older single-file JSON documents (assets as base64 in `assetData`) still open. Documents
 //! from older format versions are upgraded on load so they lay out as they did.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -20,7 +24,7 @@ use designcraft_doc::{AssetId, Document, ParaAttrs, Story};
 use serde_json::{Value, json};
 
 pub const MIME: &str = "application/vnd.designcraft+zip";
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FormatError {
@@ -48,7 +52,28 @@ fn ext_for(mime: &str) -> &'static str {
 /// Serialize a document to `.designcraft` bytes. The file holds each distinct placed file once
 /// and leaves out assets nothing references; `doc` itself keeps them (undo can bring them back).
 pub fn save(doc: &Document) -> Result<Vec<u8>, FormatError> {
+    save_with_assets(doc, true)
+}
+
+/// A native working file can omit linked originals. The engine resolves their paths before
+/// rendering; this crate never reads the file system. `save` remains self-contained for recovery,
+/// clipboard and byte-only transport. Embedded assets (no link) are always retained.
+pub fn save_working(doc: &Document) -> Result<Vec<u8>, FormatError> {
+    save_with_assets(doc, !doc.settings.external_links)
+}
+
+fn save_with_assets(doc: &Document, embed_links: bool) -> Result<Vec<u8>, FormatError> {
     let mut compact = doc.clone();
+    if !embed_links {
+        // These originals will not be written. Strip only the saved clone's cached buffers
+        // before compaction so saving links does not hash every full-resolution image.
+        let empty = Arc::new(Vec::new());
+        for asset in compact.assets.values_mut() {
+            if asset.link.is_some() && asset.is_linkable_graphic() {
+                Arc::make_mut(asset).data = empty.clone();
+            }
+        }
+    }
     compact.compact_assets();
     let doc = &compact;
     let io = |e: zip::result::ZipError| FormatError::Io(e.to_string());
@@ -60,13 +85,22 @@ pub fn save(doc: &Document) -> Result<Vec<u8>, FormatError> {
         z.start_file("mimetype", stored).map_err(io)?;
         z.write_all(MIME.as_bytes()).map_err(|e| FormatError::Io(e.to_string()))?;
         z.start_file("meta.json", deflate).map_err(io)?;
-        let meta = json!({"format": "designcraft", "version": VERSION, "generator": concat!("DesignCraft ", env!("CARGO_PKG_VERSION"))});
+        // Older readers cannot hydrate external native assets. They must refuse these files
+        // instead of opening blank artwork and then overwriting it. Ordinary saves stay v2.
+        let version = if legacy_baselines(doc) {
+            VERSION
+        } else if doc.settings.external_links {
+            3
+        } else {
+            2
+        };
+        let meta = json!({"format": "designcraft", "version": version, "generator": concat!("DesignCraft ", env!("CARGO_PKG_VERSION"))});
         z.write_all(meta.to_string().as_bytes()).map_err(|e| FormatError::Io(e.to_string()))?;
         z.start_file("document.json", deflate).map_err(io)?;
         let json = serde_json::to_vec_pretty(doc).map_err(|e| FormatError::Io(e.to_string()))?;
         z.write_all(&json).map_err(|e| FormatError::Io(e.to_string()))?;
         for (id, a) in &doc.assets {
-            if a.data.is_empty() {
+            if a.data.is_empty() || (!embed_links && a.link.is_some() && a.is_linkable_graphic()) {
                 continue;
             }
             // Already-compressed images are stored as-is.
@@ -173,7 +207,36 @@ fn upgrade(doc: &mut Document, from: u32) {
         // caps without Align Left Edge.
         pin_para_default(doc, |a| &mut a.keep_all_lines, true);
         pin_para_default(doc, |a| &mut a.drop_cap_align_left, false);
+        let mut frames = Vec::new();
+        for spread in doc.spreads.iter().chain(&doc.parents) {
+            for item in &spread.items {
+                item.walk(&mut |item| {
+                    if item.text_frame().is_some() {
+                        frames.push(item.id);
+                    }
+                });
+            }
+        }
+        for id in frames {
+            if let Some(frame) = doc.item_mut(id).and_then(|i| i.text_frame_mut()) {
+                frame.options.legacy_first_baseline = true;
+            }
+        }
     }
+}
+
+/// Older readers must refuse migrated layouts rather than ignore the compatibility setting
+/// and silently move their text. Ordinary current documents keep their existing format.
+fn legacy_baselines(doc: &Document) -> bool {
+    let mut found = false;
+    for spread in doc.spreads.iter().chain(&doc.parents) {
+        for item in &spread.items {
+            item.walk(&mut |item| {
+                found |= item.text_frame().is_some_and(|f| f.options.legacy_first_baseline);
+            });
+        }
+    }
+    found
 }
 
 /// Pin a paragraph attribute to the value an older format resolved it to where nothing set it:
@@ -346,6 +409,28 @@ mod tests {
         z.file_names().filter(|n| n.starts_with("assets/")).count()
     }
 
+    #[test]
+    fn working_files_omit_only_linked_originals_and_portable_files_keep_them() {
+        let mut doc = Document::new(&NewDocument::default());
+        let linked = png_asset(&mut doc, &[7; 4096]);
+        let embedded = png_asset(&mut doc, &[8; 4096]);
+        Arc::make_mut(doc.assets.get_mut(&linked).unwrap()).link = Some("Links/art.png".into());
+        place(&mut doc, linked, 0.0);
+        place(&mut doc, embedded, 1.0);
+        assert_eq!(asset_entries(&save_working(&doc).unwrap()), 2, "existing documents stay embedded");
+        doc.settings.external_links = true;
+        let working = save_working(&doc).unwrap();
+        assert_eq!(asset_entries(&working), 1);
+        let back = load(&working).unwrap();
+        assert!(back.settings.external_links);
+        assert!(back.assets[&linked].data.is_empty(), "the format loader must never read a source path");
+        assert_eq!(back.assets[&embedded].data.as_slice(), &[8; 4096]);
+        let portable = load(&save(&doc).unwrap()).unwrap();
+        assert_eq!(portable.assets[&linked].data.as_slice(), &[7; 4096]);
+        assert_eq!(portable.assets[&embedded].data.as_slice(), &[8; 4096]);
+        assert!(!doc.assets[&linked].data.is_empty(), "saving never discards the live original");
+    }
+
     /// Zip `d` the way files were saved with one asset per placement (nothing merged or pruned).
     fn save_uncompacted(d: &Document) -> Vec<u8> {
         let mut buf = Cursor::new(Vec::new());
@@ -386,6 +471,27 @@ mod tests {
         z.start_file("document.json", zip::write::SimpleFileOptions::default()).unwrap();
         z.write_all(&serde_json::to_vec(doc).unwrap()).unwrap();
         z.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn format_1_first_baselines_are_preserved_through_a_new_save() {
+        let mut doc = Document::new(&NewDocument::default());
+        let layer = doc.default_layer();
+        let (id, _) =
+            doc.add_text_frame(SpreadRef::Doc(0), Rect::new(10.0, 10.0, 200.0, 200.0), layer, "Legacy title", ParaFormat::default()).unwrap();
+        assert!(!doc.item(id).unwrap().text_frame().unwrap().options.legacy_first_baseline);
+        let migrated = load(&save_v1(&doc)).unwrap();
+        assert!(migrated.item(id).unwrap().text_frame().unwrap().options.legacy_first_baseline);
+        let bytes = save(&migrated).unwrap();
+        let mut archive = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        let mut meta_json = String::new();
+        archive.by_name("meta.json").unwrap().read_to_string(&mut meta_json).unwrap();
+        let meta: Value = serde_json::from_str(&meta_json).unwrap();
+        assert_eq!(meta["version"], 4, "older readers must refuse rather than silently move text");
+        let reopened = load(&bytes).unwrap();
+        assert!(reopened.item(id).unwrap().text_frame().unwrap().options.legacy_first_baseline);
+        let modern = load(&save(&doc).unwrap()).unwrap();
+        assert!(!modern.item(id).unwrap().text_frame().unwrap().options.legacy_first_baseline);
     }
 
     fn para_style(name: &str, based_on: Option<&str>, keep_all_lines: Option<bool>) -> designcraft_doc::ParagraphStyle {
