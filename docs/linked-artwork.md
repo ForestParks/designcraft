@@ -40,8 +40,7 @@ An unresolved link cannot be embedded until its original is supplied.
 Package collects available originals in `Links/`; its native document retains the chosen
 storage mode. PDF and print output use the loaded full-resolution artwork. This option reduces
 working-file storage and serialization. Encoded originals remain resident for reliable export,
-undo and recovery. Decoded screen pixels are loaded on demand and managed separately; see
-[display performance](display-performance.md). External artwork reads are limited to 512 MiB
+undo and recovery. External artwork reads are limited to 512 MiB
 per source file; use embedded storage for larger sources. EPS retains the existing preview
 rendering behavior; this change does not add a PostScript interpreter.
 

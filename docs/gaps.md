@@ -185,9 +185,7 @@ Kind: **F** feature · **U** UI/UX · **T** typography · **FF** file format · 
 - **Missing:** incremental composition (recompose from the edited paragraph; 8 ms keystroke
   budget), benchmarks against InDesign on long books and image-heavy catalogues.
 - **Have:** compose 300k characters ~38 ms warm, damage-region repaint (< 1 ms while typing),
-  parallel story composition. Image previews reuse cached mip levels before full decoding;
-  decoded artwork is bounded, and visible page thumbnails render in the background on native.
-  See [display performance](display-performance.md).
+  parallel story composition.
 - **Estimate:** 40–80 h.
 
 ### 26. Autoflow fills the following pages before it adds pages (F)
