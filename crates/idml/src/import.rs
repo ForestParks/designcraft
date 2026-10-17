@@ -3066,6 +3066,7 @@ impl<'r> Importer<'r> {
         let size = svg_viewbox_size(&data).unwrap_or(size);
         let (mime, px) = if preview.is_some() { (None, None) } else { sniff_image(&data) };
         let mime = mime.map(str::to_string).unwrap_or_else(|| match link.and_then(|k| k.get("LinkResourceFormat")).unwrap_or("") {
+            f if f.contains("EPS") || g.local() == "EPS" => "application/postscript".into(),
             f if f.contains("JPEG") => "image/jpeg".into(),
             f if f.contains("TIFF") => "image/tiff".into(),
             f if f.contains("PDF") || g.local() == "PDF" => "application/pdf".into(),
