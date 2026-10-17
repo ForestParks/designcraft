@@ -618,13 +618,8 @@ fn file_place(s: &mut Session, p: &Value) -> Result<Value> {
     if lname.ends_with(".idml") || lname.ends_with(".designcraft") {
         return place_layout_page(s, p, &name, &bytes);
     }
-    // EPS: shown and printed through its preview (or a placeholder) at its bounding box size.
-    let (bytes, eps_size) = if designcraft_images::is_eps(&bytes) {
-        let (proxy, size) = designcraft_images::eps_proxy(&bytes).ok_or_else(|| bad("file.place", "the EPS has no bounding box"))?;
-        (proxy, Some(size))
-    } else {
-        (bytes, None)
-    };
+    // Keep the EPS source for link comparison; rendering uses its preview at the bounding box size.
+    let eps_size = eps_size(&bytes, "file.place")?;
     // Video and sound: a media frame (Window › Interactive › Media).
     if let Some(mime) = designcraft_doc::media_mime(&name) {
         return super::media::place_media(s, p, name, mime, bytes, link);
@@ -715,10 +710,12 @@ fn file_place(s: &mut Session, p: &Value) -> Result<Value> {
             // Fill the frame proportionally once. Auto-Fit stays off, so resizing the frame crops.
             let k = (r.width() / bw).max(r.height() / bh);
             let (gw, gh) = (bw * k, bh * k);
+            let xf = Affine::translate((r.x0 + (r.width() - gw) / 2.0, r.y0 + (r.height() - gh) / 2.0)) * Affine::scale(k);
+            validate_placement((bw, bh), r, xf, "file.place")?;
             it.content = Content::Graphic(Graphic {
                 asset: aid,
                 size: (bw, bh),
-                xf: Affine::translate((r.x0 + (r.width() - gw) / 2.0, r.y0 + (r.height() - gh) / 2.0)) * Affine::scale(k),
+                xf,
                 clip: None,
                 auto_fit: Default::default(),
                 fit_align: 4,
@@ -734,6 +731,8 @@ fn file_place(s: &mut Session, p: &Value) -> Result<Value> {
             let id = ItemId(d.alloc());
             let k = w / nw;
             let r = super::finite_rect("file.place", Rect::new(x, y, x + bw * k, y + bh * k))?;
+            let xf = Affine::translate((x, y)) * Affine::scale(k);
+            validate_placement((bw, bh), r, xf, "file.place")?;
             let mut it = Item::new(id, lid, Shape::Rectangle, shapes::rectangle(r));
             it.object_style = d.styles.default_graphic_frame.clone();
             if let Some(e) = d.styles.object_effects(&it.object_style) {
@@ -742,7 +741,7 @@ fn file_place(s: &mut Session, p: &Value) -> Result<Value> {
             it.content = Content::Graphic(Graphic {
                 asset: aid,
                 size: (bw, bh),
-                xf: Affine::translate((x, y)) * Affine::scale(k),
+                xf,
                 clip: None,
                 auto_fit: Default::default(),
                 fit_align: 4,
@@ -821,10 +820,35 @@ pub(crate) fn read_source(p: &Value) -> Result<(Vec<u8>, String, Option<String>)
     Ok((b, name, Some(path.to_string())))
 }
 
+fn eps_size(bytes: &[u8], command: &str) -> Result<Option<(f64, f64)>> {
+    if !designcraft_images::is_eps(bytes) {
+        return Ok(None);
+    }
+    designcraft_images::eps_size(bytes)
+        .map(Some)
+        .ok_or_else(|| bad(command, "the EPS has a missing or invalid bounding box (dimensions must be 0.001–20,000 points)"))
+}
+
+/// Fitting can overflow even with finite inputs. Never persist NaN/Inf as JSON nulls.
+pub(crate) fn validate_placement(size: (f64, f64), frame: Rect, xf: Affine, command: &str) -> Result<()> {
+    let valid_rect = |r: Rect| [r.x0, r.y0, r.x1, r.y1, r.width(), r.height()].iter().all(|n| n.is_finite()) && r.width() >= 0.0 && r.height() >= 0.0;
+    if !size.0.is_finite()
+        || !size.1.is_finite()
+        || size.0 <= 0.0
+        || size.1 <= 0.0
+        || !valid_rect(frame)
+        || !xf.as_coeffs().iter().all(|n| n.is_finite())
+        || !valid_rect(xf.transform_rect_bbox(Rect::new(0.0, 0.0, size.0, size.1)))
+    {
+        return Err(bad(command, "image placement exceeds finite geometry limits"));
+    }
+    Ok(())
+}
+
 fn place_load(s: &mut Session, p: &Value) -> Result<Value> {
     let (bytes, name, link) = read_source(p)?;
     let (pw, ph) = designcraft_render::image_size(&bytes).ok_or_else(|| bad("place.load", "unsupported or corrupt image"))?;
-    let natural = designcraft_render::natural_size(&bytes, 0).unwrap_or((pw as f64, ph as f64));
+    let natural = eps_size(&bytes, "place.load")?.or_else(|| designcraft_render::natural_size(&bytes, 0)).unwrap_or((pw as f64, ph as f64));
     let mime = designcraft_render::image_mime(&bytes).to_string();
     let asset = Asset { name, mime, link, data: Arc::new(bytes), pixels: Some((pw, ph)), ..Default::default() };
     load_cursor(s, asset, natural)
@@ -855,55 +879,53 @@ fn place_drop(s: &mut Session, p: &Value) -> Result<Value> {
     let frame = super::id_param(p, "frame");
     let rect = super::rect_param(p, "rect");
     let (x, y) = (super::f64_or(p, "x", 0.0), super::f64_or(p, "y", 0.0));
+    let d = &s.doc()?.doc;
+    let (frame_rect, xf, auto_fit) = if let Some(fid) = frame {
+        let r = d.item(fid).ok_or(designcraft_doc::DocError::NoItem(fid))?.inner_bounds();
+        let k = (r.width() / nw).max(r.height() / nh);
+        let xf = Affine::translate((r.x0 + (r.width() - nw * k) / 2.0, r.y0 + (r.height() - nh * k) / 2.0)) * Affine::scale(k);
+        // Fill the frame proportionally once. Auto-Fit stays off, so resizing the frame crops.
+        (r, xf, Default::default())
+    } else {
+        if d.spread(sr).is_none() {
+            return Err(bad("place.drop", "no such spread"));
+        }
+        // Drag: fit proportionally; click: actual size at the point.
+        let (r, k) = match rect {
+            Some(r) if r.width() > 2.0 && r.height() > 2.0 => {
+                let k = (r.width() / nw).min(r.height() / nh);
+                (Rect::new(r.x0, r.y0, r.x0 + nw * k, r.y0 + nh * k), k)
+            }
+            _ => (Rect::new(x, y, x + nw, y + nh), 1.0),
+        };
+        (r, Affine::translate((r.x0, r.y0)) * Affine::scale(k), Default::default())
+    };
+    validate_placement((nw, nh), frame_rect, xf, "place.drop")?;
     let r = s.edit(|d, sel| {
-        let id = match frame {
-            Some(fid) => {
-                let it = d.item_mut(fid).ok_or(designcraft_doc::DocError::NoItem(fid))?;
-                let r = it.inner_bounds();
-                let k = (r.width() / nw).max(r.height() / nh);
-                it.content = Content::Graphic(Graphic {
-                    asset: aid,
-                    size: (nw, nh),
-                    xf: Affine::translate((r.x0 + (r.width() - nw * k) / 2.0, r.y0 + (r.height() - nh * k) / 2.0)) * Affine::scale(k),
-                    clip: None,
-                    auto_fit: Default::default(),
-                    fit_align: 4,
-                    crop: [0.0; 4],
-                    wrap: Default::default(),
-                    fill: Default::default(),
-                });
-                fid
+        let graphic = Content::Graphic(Graphic {
+            asset: aid,
+            size: (nw, nh),
+            xf,
+            clip: None,
+            auto_fit,
+            fit_align: 4,
+            crop: [0.0; 4],
+            wrap: Default::default(),
+            fill: Default::default(),
+        });
+        let id = if let Some(fid) = frame {
+            d.item_mut(fid).ok_or(designcraft_doc::DocError::NoItem(fid))?.content = graphic;
+            fid
+        } else {
+            let id = ItemId(d.alloc());
+            let mut it = Item::new(id, lid, Shape::Rectangle, shapes::rectangle(frame_rect));
+            it.object_style = d.styles.default_graphic_frame.clone();
+            if let Some(e) = d.styles.object_effects(&it.object_style) {
+                it.effects = e.clone();
             }
-            None => {
-                // Drag: fit proportionally into the dragged rect; click: actual size at the point.
-                let (frame_r, k) = match rect {
-                    Some(r) if r.width() > 2.0 && r.height() > 2.0 => {
-                        let k = (r.width() / nw).min(r.height() / nh);
-                        (Rect::new(r.x0, r.y0, r.x0 + nw * k, r.y0 + nh * k), k)
-                    }
-                    _ => (Rect::new(x, y, x + nw, y + nh), 1.0),
-                };
-                let frame_r = super::finite_rect("place.drop", frame_r)?;
-                let id = ItemId(d.alloc());
-                let mut it = Item::new(id, lid, Shape::Rectangle, shapes::rectangle(frame_r));
-                it.object_style = d.styles.default_graphic_frame.clone();
-                if let Some(e) = d.styles.object_effects(&it.object_style) {
-                    it.effects = e.clone();
-                }
-                it.content = Content::Graphic(Graphic {
-                    asset: aid,
-                    size: (nw, nh),
-                    xf: Affine::translate((frame_r.x0, frame_r.y0)) * Affine::scale(k),
-                    clip: None,
-                    auto_fit: Default::default(),
-                    fit_align: 4,
-                    crop: [0.0; 4],
-                    wrap: Default::default(),
-                    fill: Default::default(),
-                });
-                d.insert_item(sr, it, None)?;
-                id
-            }
+            it.content = graphic;
+            d.insert_item(sr, it, None)?;
+            id
         };
         *sel = Selection::items(vec![id]);
         Ok(json!({"id": id.0}))
@@ -1452,6 +1474,9 @@ mod new_document_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+pub(crate) mod eps_place_tests;
 
 #[cfg(test)]
 mod pdf_crop_tests {

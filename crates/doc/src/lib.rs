@@ -611,7 +611,7 @@ impl Asset {
     /// Formats whose source bytes can be loaded again for native linked-only artwork.
     /// Media keeps its embedded data; an extension alone is not enough to trust its contents.
     pub fn is_linkable_graphic(&self) -> bool {
-        self.is_raster() || matches!(self.mime.as_str(), "application/pdf" | "image/svg+xml")
+        self.is_raster() || matches!(self.mime.as_str(), "application/pdf" | "application/postscript" | "image/svg+xml")
     }
 
     /// A raster image (PNG, JPEG, GIF, WebP, TIFF, BMP, PSD), as opposed to a PDF, EPS or SVG.

@@ -169,6 +169,9 @@ fn install_graphic(asset: &mut designcraft_doc::Asset, bytes: Arc<Vec<u8>>) -> s
     // A source may have changed while the layout was closed. Match Update Link's pixel
     // metadata refresh so the Links panel's effective resolution describes the loaded file.
     asset.pixels = Some(pixels.ok_or("linked artwork is corrupt or its selected PDF page is unavailable")?);
+    if designcraft_images::is_eps(&bytes) {
+        asset.mime = "application/postscript".into();
+    }
     asset.data = bytes;
     // The source can change while closed; a stored PDF crop belongs to the previous bytes.
     super::file::crop_pdf(asset);
@@ -186,16 +189,17 @@ fn read_graphic(path: &Path, mime: &str) -> std::result::Result<Arc<Vec<u8>>, St
         return Err("linked artwork must be nonempty and at most 512 MiB".into());
     }
     let size_usize = usize::try_from(size).map_err(|e| e.to_string())?;
-    let mut bytes = crate::io::read_capped(path, MAX_LINK_BYTES).map_err(|e| e.to_string())?;
+    let bytes = crate::io::read_capped(path, MAX_LINK_BYTES).map_err(|e| e.to_string())?;
     if bytes.len() != size_usize {
         return Err("linked artwork changed while it was being read".into());
     }
-    // Current EPS placement caches a PNG proxy; rebuild that same representation. The
-    // separate EPS source-retention work can later replace this with original EPS bytes.
-    if designcraft_images::is_eps(&bytes) {
-        bytes = designcraft_images::eps_proxy(&bytes).ok_or("linked EPS has no usable preview or bounding box")?.0;
+    // Keep the EPS original, just as Place and Update Link do. Earlier working files may
+    // identify their cached EPS preview as PNG; accept that migration without losing the source.
+    let retained_eps = designcraft_images::is_eps(&bytes);
+    if retained_eps && designcraft_images::eps_size(&bytes).is_none() {
+        return Err("linked EPS has no usable bounding box".into());
     }
-    if designcraft_images::mime(&bytes) != mime {
+    if designcraft_images::mime(&bytes) != mime && !(retained_eps && mime == "image/png") {
         return Err("linked artwork no longer matches its saved image type".into());
     }
     Ok(Arc::new(bytes))

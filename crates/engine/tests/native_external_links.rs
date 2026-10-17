@@ -73,7 +73,7 @@ fn linked_save_is_small_reopens_and_exports_the_same_pdf() {
     assert_eq!(assets(&linked), 0);
     assert!(std::fs::metadata(&linked).unwrap().len() < std::fs::metadata(&embedded).unwrap().len());
     assert_eq!(archive(&embedded).2, 2, "ordinary documents still open in older readers");
-    assert_eq!(archive(&linked).2, 3, "older readers must reject external native artwork");
+    assert_eq!(archive(&linked).2, 4, "older readers must reject external native artwork");
     let mut reopened = Session::new();
     let opened = reopened.execute("file.open", &json!({"path": linked})).unwrap();
     assert_eq!(opened["warnings"], json!([]));
@@ -317,4 +317,44 @@ fn changed_external_pdf_recalculates_its_saved_crop() {
     let expected = designcraft_render::pdf_crop_box(&asset.data, asset.page as usize, asset.pdf_crop).unwrap().0;
     assert_ne!(before, expected);
     assert_eq!(asset.pdf_box, Some(expected), "the cached crop belongs to the new source bytes");
+}
+
+#[test]
+fn external_eps_retains_originals_on_reopen_and_migrates_legacy_preview_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("logo.eps");
+    let bytes = b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 20 10\n%%EOF\n";
+    std::fs::write(&source, bytes).unwrap();
+    for legacy_preview in [false, true] {
+        let mut session = Session::new();
+        session.execute("file.new", &json!({})).unwrap();
+        session.execute("file.place", &json!({"path": source})).unwrap();
+        let aid = *session.doc().unwrap().doc.assets.keys().next().unwrap();
+        if legacy_preview {
+            session
+                .edit(|d, _| {
+                    let asset = Arc::make_mut(d.assets.get_mut(&aid).unwrap());
+                    asset.data = Arc::new(designcraft_images::eps_proxy(bytes).unwrap().0);
+                    asset.mime = "image/png".into();
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let path = temp.path().join(format!("linked-{legacy_preview}.designcraft"));
+        session.execute("file.saveAs", &json!({"path": path, "embedImages": false})).unwrap();
+        assert_eq!(archive(&path).2, 4);
+        assert_eq!(assets(&path), 0);
+        let mut reopened = Session::new();
+        let result = reopened.execute("file.open", &json!({"path": path})).unwrap();
+        assert_eq!(result["warnings"], json!([]));
+        let asset = &reopened.doc().unwrap().doc.assets[&aid];
+        assert_eq!(asset.data.as_slice(), bytes);
+        assert_eq!(asset.mime, "application/postscript");
+        assert!(designcraft_render::decode_pixmap(&asset.data).is_some());
+        assert_eq!(reopened.execute("links.list", &json!({})).unwrap()[0]["status"], "ok");
+        reopened.execute("file.save", &json!({"embedImages": true})).unwrap();
+        let embedded = designcraft_format::load(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(embedded.assets[&aid].data.as_slice(), bytes);
+        assert_eq!(archive(&path).2, 3, "embedded EPS uses upstream's reader capability");
+    }
 }

@@ -129,4 +129,4 @@ This adds external storage; cached editing data is still loaded in memory, and m
 do not yet have saved previews.
 
 Native format 1 text frames now preserve ascent-derived first-baseline offsets. Files retaining
-these compatibility settings use native format 4 so earlier readers reject them safely.
+these compatibility settings use native format 5 so earlier readers reject them safely.

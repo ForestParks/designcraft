@@ -53,13 +53,13 @@ Recovery, clipboard/snippets and `file.serialize` remain self-contained. Byte-on
 files, so it keeps any embedded data and warns about unresolved artwork instead of reading
 paths supplied inside a document. The Links panel option is disabled on the web.
 
-External-link working files use native format 3. Older applications must ask for an update
+External-link working files use native format 4. Older applications must ask for an update
 rather than open the layout with silently missing artwork. Ordinary embedded files remain
-format 2; opening older files never converts them to external storage automatically.
+format 2 (format 3 when retaining EPS originals); opening older files never converts them to external storage automatically.
 
 Native format 1 layouts retain their original first-baseline calculations when opened. Saves
-containing this compatibility setting use format 4, including embedded saves, so older readers
+containing this compatibility setting use format 5, including embedded saves, so older readers
 refuse them instead of silently moving text. Current documents without this setting remain
-format 2 (embedded) or format 3 (linked). Changing the first-baseline kind in Text Frame
+format 2 (embedded), format 3 (embedded EPS) or format 4 (linked). Changing the first-baseline kind in Text Frame
 Options adopts the current calculation for that frame. Reconfirming the same kind or changing
 unrelated frame options retains compatibility.

@@ -13,7 +13,7 @@ mod eps;
 mod jpeg;
 mod psd;
 mod tone;
-pub use eps::{bounding_box as eps_bounding_box, eps_proxy, is_eps};
+pub use eps::{bounding_box as eps_bounding_box, eps_pixel_size, eps_png, eps_proxy, eps_size, is_eps};
 pub use tone::{Tone, tone};
 
 /// CSS pixels (SVG user units) → points.
@@ -37,6 +37,9 @@ pub fn is_svg(bytes: &[u8]) -> bool {
 
 /// MIME type of a placed graphic.
 pub fn mime(bytes: &[u8]) -> &'static str {
+    if is_eps(bytes) {
+        return "application/postscript";
+    }
     if is_pdf(bytes) {
         return "application/pdf";
     }
