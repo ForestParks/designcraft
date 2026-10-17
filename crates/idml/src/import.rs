@@ -3711,9 +3711,23 @@ fn wrap_path_of(pg: &El) -> std::result::Result<PathData, &'static str> {
     Ok(PathData::new(subs))
 }
 
-/// IDML link URI → file system path (`file:/a%20b` → `/a b`, `file:///C:/x` → `C:/x`).
+/// IDML link URI → file system path (`file:/a%20b` → `/a b`, `file:///C:/x` → `C:/x`). A URI
+/// naming another computer keeps it as a network path (`file://host/s/x` → `//host/s/x`).
 pub(crate) fn uri_to_path(uri: &str) -> String {
-    let rest = uri.strip_prefix("file://").or_else(|| uri.strip_prefix("file:")).unwrap_or(uri);
+    let rest = match uri.strip_prefix("file://") {
+        Some(rest) => {
+            let host_end = rest.find(['/', '\\']).unwrap_or(rest.len());
+            let host = rest.get(..host_end).unwrap_or_default();
+            if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+                rest.get(host_end..).unwrap_or(rest)
+            } else if matches!(host.as_bytes(), [letter, b':'] if letter.is_ascii_alphabetic()) {
+                rest
+            } else {
+                return format!("//{}", percent_decode(rest));
+            }
+        }
+        None => uri.strip_prefix("file:").unwrap_or(uri),
+    };
     // `file:///C:/…` → `/C:/…` → `C:/…`
     let rest = match rest.as_bytes() {
         [b'/', _, b':', _, ..] => rest.get(1..).unwrap_or(rest),

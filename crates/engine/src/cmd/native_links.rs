@@ -56,6 +56,32 @@ fn require_originals(doc: &Document) -> Result<()> {
     Ok(())
 }
 
+/// Resolve live references against the source document before Save As changes its path.
+/// Apply only to the prepared clone, so a refused save leaves the live document untouched.
+pub(super) fn prepare_paths(saved: &mut Document, document: Option<&Path>) -> Result<()> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if saved.settings.external_links {
+        for id in saved.used_assets() {
+            let Some(asset) = saved.assets.get_mut(&id) else { continue };
+            if !asset.is_linkable_graphic() {
+                continue;
+            }
+            let Some(link) = asset.link.as_deref() else { continue };
+            match crate::io::document_path(link, document) {
+                Ok(source) => Arc::make_mut(asset).link = Some(source.to_string_lossy().into_owned()),
+                Err(why) if !asset.data.is_empty() => {
+                    return Err(bad("file.save", format!("{}: {why}; Relink or Embed it before saving links only", asset.name)));
+                }
+                // An unresolved reference can still be saved, without following or rewriting it.
+                Err(_) => {}
+            }
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = (saved, document);
+    Ok(())
+}
+
 /// Serialize for a known destination. Only the saved clone gets relative paths; Save As and
 /// Save a Copy must not rebase the live document or its undo history.
 pub(super) fn save(doc: &Document, destination: &Path) -> Result<Vec<u8>> {
@@ -79,7 +105,13 @@ fn rebase(saved: &mut Document, destination: &Path) -> Result<()> {
                 continue;
             }
             let Some(link) = asset.link.as_deref() else { continue };
-            let source = std::path::absolute(link).map_err(|e| EngineError::Other(e.to_string()))?;
+            let source = match crate::io::document_path(link, Some(&destination)) {
+                Ok(source) => source,
+                Err(why) if !asset.data.is_empty() => {
+                    return Err(bad("file.save", format!("{}: {why}; Relink or Embed it before saving links only", asset.name)));
+                }
+                Err(_) => continue,
+            };
             // A missing link with a cached original would lose its last copy on disk. Keep
             // the old file and unsaved state intact; Embed or Relink is an explicit choice.
             if !asset.data.is_empty() && (!crate::io::is_file(&source) || crate::io::read_capped(&source, 0).is_err()) {
@@ -114,10 +146,10 @@ pub(super) fn resolve(doc: &mut Document, path: Option<&Path>) -> Vec<String> {
         let Some(asset) = doc.assets.get_mut(&id) else { continue };
         let Some(link) = asset.link.clone() else { continue };
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(dir) = path.and_then(Path::parent)
+        if let Some(document) = path
             && asset.is_linkable_graphic()
         {
-            let source = std::path::absolute(dir.join(&link));
+            let source = crate::io::document_path(&link, Some(document));
             if let Ok(source) = source {
                 let asset = Arc::make_mut(asset);
                 asset.link = Some(source.to_string_lossy().into_owned());
@@ -146,6 +178,9 @@ pub(super) fn resolve(doc: &mut Document, path: Option<&Path>) -> Vec<String> {
                         continue;
                     }
                 }
+            } else if let Err(why) = source {
+                warnings.push(format!("{}: {why}; use Relink to locate {link}", asset.name));
+                continue;
             }
         }
         #[cfg(target_arch = "wasm32")]

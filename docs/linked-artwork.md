@@ -34,6 +34,11 @@ and its `Links/` folder together keeps them connected. Opening a native file loa
 originals into memory for editing and full-resolution export. Changes to a source during the
 session still appear as Modified in the Links panel and can be accepted with Update.
 Reopening a changed linked PDF recalculates its saved crop box from the new source bytes.
+Linked-only open and save use the same path checks as other document links: paths to other
+computers (apart from the document's own network share) and URLs are refused before file-system
+access. Device paths are rejected or skipped as nonregular files before reading originals.
+The Links panel explains refused paths. Relative references resolve from
+the source document, including when switching to linked storage with Save As or Save a Copy.
 
 If an original cannot be found when opening, the layout opens with a warning and the missing
 link can be relinked. There is no saved preview for unresolved artwork in this first version.

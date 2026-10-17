@@ -59,6 +59,7 @@ pub fn specs() -> Vec<CommandSpec> {
             let path = with_document_extension(path);
             let mut copy = (*s.doc()?.doc).clone();
             super::native_links::save_options(&mut copy, p)?;
+            super::native_links::prepare_paths(&mut copy, s.doc()?.path.as_deref().map(std::path::Path::new))?;
             super::datamerge::refresh_relative_paths(&mut copy, std::path::Path::new(&path));
             let bytes = to_bytes_with_preview(&copy, &s.cache, std::path::Path::new(&path))?;
             #[cfg(not(target_arch = "wasm32"))]
@@ -485,7 +486,7 @@ fn open_path(s: &mut Session, p: &Value) -> Result<Value> {
         let (mut d, mut warnings) = load_bytes(&bytes)?;
         warnings.extend(super::native_links::resolve(&mut d, Some(std::path::Path::new(path))));
         if !d.settings.external_links {
-            super::interchange::resolve_packaged_links(&mut d, std::path::Path::new(path).parent());
+            super::interchange::resolve_packaged_links(&mut d, Some(std::path::Path::new(path)));
         }
         super::datamerge::resolve_sources_on_open(&mut d, Some(std::path::Path::new(path)));
         let (fonts, faces, font_warnings) = load_document_fonts(&mut d, path);
@@ -572,8 +573,10 @@ fn file_save(s: &mut Session, p: &Value) -> Result<Value> {
     // Prepare paths for the destination without changing the live document until persistence succeeds.
     let mut saved = (*st.doc).clone();
     super::native_links::save_options(&mut saved, p)?;
+    super::native_links::prepare_paths(&mut saved, st.path.as_deref().map(std::path::Path::new))?;
     super::datamerge::refresh_relative_paths(&mut saved, std::path::Path::new(&path));
-    let paths_changed = saved.data_merge != st.doc.data_merge || saved.settings.external_links != st.doc.settings.external_links;
+    let paths_changed =
+        saved.data_merge != st.doc.data_merge || saved.settings.external_links != st.doc.settings.external_links || saved.assets != st.doc.assets;
     let saved = if paths_changed { Arc::new(saved) } else { st.doc.clone() };
     let bytes = to_bytes_with_preview(&saved, &s.cache, std::path::Path::new(&path))?;
     #[cfg(not(target_arch = "wasm32"))]
@@ -608,7 +611,10 @@ fn file_place(s: &mut Session, p: &Value) -> Result<Value> {
         #[cfg(target_arch = "wasm32")]
         let b: Vec<u8> = vec![];
         let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.into());
-        (b, name, Some(path.to_string()))
+        // A path explicitly chosen by the caller is relative to the command's working
+        // directory. Store its absolute form before it becomes document-supplied data.
+        let link = std::path::absolute(path).map_err(|e| bad("file.place", e.to_string()))?;
+        (b, name, Some(link.to_string_lossy().into_owned()))
     } else {
         s.ui_requests.push(crate::UiRequest::Pick { purpose: "place".into(), params: json!({}) });
         return ok();
@@ -958,7 +964,7 @@ fn snippet_export(s: &mut Session, p: &Value) -> Result<Value> {
 fn place_layout_page(s: &mut Session, p: &Value, name: &str, bytes: &[u8]) -> Result<Value> {
     const ID: &str = "file.place";
     let mut src = if name.to_lowercase().ends_with(".idml") {
-        super::interchange::import_idml_confined(bytes).map_err(|e| bad(ID, e.to_string()))?
+        super::interchange::import_idml_confined(bytes, str_param(p, "path").map(std::path::Path::new)).map_err(|e| bad(ID, e.to_string()))?
     } else {
         from_bytes(bytes)?
     };
@@ -1087,7 +1093,7 @@ fn file_revert(s: &mut Session, _: &Value) -> Result<Value> {
     {
         let mut d = if path.to_ascii_lowercase().ends_with(".idml") {
             let bytes = crate::io::read_file(&path).map_err(EngineError::Other)?;
-            super::interchange::import_idml_confined(&bytes).map_err(|e| EngineError::Other(e.to_string()))?
+            super::interchange::import_idml_confined(&bytes, Some(std::path::Path::new(&path))).map_err(|e| EngineError::Other(e.to_string()))?
         } else {
             from_bytes(&crate::io::read_file(&path).map_err(EngineError::Other)?)?
         };
