@@ -2283,6 +2283,13 @@ pub fn links_panel(app: &mut DesignApp, ui: &mut egui::Ui) {
         {
             app.status(error.to_string());
         }
+        crate::rtl::label(
+            ui,
+            crate::i18n::tr(
+                &app.ui.language,
+                "Linked-only saves need the original files. Keep them with the document: moving, deleting or changing them can leave artwork missing or changed when reopening. Use Package to collect originals, or Embed for a self-contained file.",
+            ),
+        );
         ui.separator();
     }
     // Linked stories (Place and Link).
@@ -2867,6 +2874,7 @@ mod tests {
         let mut app = DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
         app.run("file.new", json!({})).unwrap();
         let mut harness = Harness::builder().with_size(vec2(320.0, 300.0)).build_ui_state(|ui, app: &mut DesignApp| links_panel(app, ui), app);
+        harness.get_by_label("Linked-only saves need the original files. Keep them with the document: moving, deleting or changing them can leave artwork missing or changed when reopening. Use Package to collect originals, or Embed for a self-contained file.");
         harness.get_by_label("Keep linked artwork external on save").click();
         harness.run_steps(2);
         assert!(harness.state().session.doc().unwrap().doc.settings.external_links);

@@ -22,6 +22,8 @@ Or set it while saving:
 file.saveAs {"path":"/project/layout.designcraft","embedImages":false}
 ```
 
+The Links panel warns before changing the storage option: linked-only files depend on the external originals. Keep sources with the document, use Package to collect them, or Embed for a self-contained file.
+
 The next `file.save` remembers that choice. `embedImages:true` switches back to including
 linked originals; `links.storage {"mode":"embedded"}` does the same. `file.saveACopy` accepts
 the option without changing the open document's mode, path or saved state.
