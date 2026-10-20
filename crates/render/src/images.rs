@@ -256,6 +256,8 @@ pub fn clear() {
 mod disk;
 #[cfg(not(target_arch = "wasm32"))]
 pub use disk::set_directory as set_preview_directory;
+#[cfg(not(target_arch = "wasm32"))]
+pub use disk::set_enabled as set_preview_enabled;
 
 #[cfg(test)]
 mod preview_tests {

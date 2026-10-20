@@ -16,9 +16,18 @@ isolated `DESIGNCRAFT_CONFIG_DIR` profiles). Cache keys contain a version, SHA-2
 bytes, PDF-page index, mip level and active colour settings. A renderer/dependency fingerprint invalidates previews
 when decoding code or pinned dependencies change, including development builds. Preview files preserve premultiplied pixels exactly and
 have checksums; corrupt, missing or unwritable caches fall back to originals. The disk budget
-is 512 MiB. PDF dimensions come from the pinned rasterizer without drawing the page, so cached PDF
+is 512 MiB across all cache versions, evicting the oldest files first. Abandoned write temporaries older than 24 hours are cleaned at startup and after writes; recent temporaries are left alone so another instance can finish writing. PDF dimensions come from the pinned rasterizer without drawing the page, so cached PDF
 previews can be reused immediately. SVG previews remain in memory because they can depend on
 document or installed fonts. CLI and web have no disk cache unless a native host enables it.
+
+Disk previews can contain readable image and PDF-page content after the document closes.
+In **Preferences › Display Performance**, turn off **Save image previews on this computer**
+to stop using persistent previews; in-memory previews and export quality are unchanged.
+To clear existing disk previews, close all DesignCraft instances and delete only the `Previews`
+subfolder of the active profile. Default profiles are `~/Library/Application Support/DesignCraft`
+on macOS, `%APPDATA%/DesignCraft` on Windows, and `$XDG_CONFIG_HOME/designcraft` (or
+`~/.config/designcraft`) on Linux; `DESIGNCRAFT_CONFIG_DIR` and portable mode override them.
+Never delete the profile itself: it also contains preferences and recovery data.
 
 Page thumbnails render on a separate native worker, one visible page at a time, prioritizing
 pages closest to the current page. Old revision results cannot replace new thumbnails. The texture cache retains at most 128 thumbnails. Local

@@ -245,6 +245,8 @@ pub struct UiState {
     pub ink_limit: Option<f32>,
     /// View › Display Performance.
     pub display_quality: designcraft_render::DisplayQuality,
+    /// Native disposable disk previews; originals and memory previews are unaffected.
+    pub persist_image_previews: bool,
     /// Preferences › Interface › UI scaling (1 = 100%).
     pub ui_scale: f32,
     /// Preferences › Appearance of Black: 100% K on screen as rich black (InDesign's default,
@@ -393,6 +395,7 @@ impl Default for UiState {
             separation: None,
             ink_limit: None,
             display_quality: designcraft_render::DisplayQuality::High,
+            persist_image_previews: true,
             ui_scale: 1.0,
             rich_black: true,
             overprint_preview: false,

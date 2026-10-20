@@ -77,6 +77,7 @@ impl eframe::App for App {
             self.startup.opening(apple_events::poll(&self.apple_events, &mut self.app, ctx));
         }
         self.app.logic(ctx);
+        designcraft_render::images::set_preview_enabled(!no_prefs() && self.app.ui.persist_image_previews);
         self.startup.leave();
     }
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {

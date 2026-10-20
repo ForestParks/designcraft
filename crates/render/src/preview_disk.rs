@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use sha2::{Digest, Sha256};
@@ -25,9 +25,18 @@ struct Disk {
 }
 static DISK: Mutex<Option<Disk>> = Mutex::new(None);
 static NEXT: AtomicU64 = AtomicU64::new(0);
+static ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Disabling persistence leaves the in-memory previews and original artwork unchanged.
+pub fn set_enabled(enabled: bool) {
+    ENABLED.store(enabled, Ordering::Relaxed);
+}
 
 /// A native host supplies its cache directory. None disables persistence (CLI and web default).
 pub fn set_directory(directory: Option<PathBuf>) {
+    if let Some(dir) = &directory {
+        prune(dir);
+    }
     let mut disk = DISK.lock().unwrap_or_else(|e| e.into_inner());
     *disk = Some(Disk { directory, ..Default::default() });
 }
@@ -54,6 +63,9 @@ fn renderer_tag() -> &'static str {
 }
 
 fn path(bytes: &Arc<Vec<u8>>, page: u32, level: u8) -> Option<PathBuf> {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return None;
+    }
     let id = Arc::as_ptr(bytes) as usize;
     let (directory, hash) = {
         let disk = DISK.lock().unwrap_or_else(|e| e.into_inner());
@@ -137,17 +149,38 @@ pub(super) fn store(bytes: &Arc<Vec<u8>>, page: u32, level: u8, pm: &Pixmap) {
 }
 
 fn prune(dir: &Path) {
+    prune_with_budget(dir, DISK_BUDGET, std::time::SystemTime::now());
+}
+
+// Recognize past and future cache versions too: renderer changes must not orphan files.
+fn cache_name(name: &str) -> bool {
+    let Some((version, _)) = name.strip_prefix('v').and_then(|s| s.split_once('-')) else { return false };
+    !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn prune_with_budget(dir: &Path, budget: u64, now: std::time::SystemTime) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut files = Vec::new();
     let mut total = 0u64;
     for entry in entries.filter_map(std::result::Result::ok) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !(name.starts_with("v1-") || name.starts_with("v2-")) || !name.ends_with(".dcpreview") {
+        if !cache_name(&name) {
+            continue;
+        }
+        // Do not follow symlinks or touch directories, including similarly named ones.
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
-        if !meta.is_file() {
+        if name.ends_with(".tmp") {
+            // Another process may still be writing a fresh temporary. Only reap abandoned ones.
+            if meta.modified().ok().and_then(|t| now.duration_since(t).ok()).is_some_and(|age| age.as_secs() >= 24 * 60 * 60) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+            continue;
+        }
+        if !name.ends_with(".dcpreview") {
             continue;
         }
         total = total.saturating_add(meta.len());
@@ -155,7 +188,7 @@ fn prune(dir: &Path) {
     }
     files.sort_unstable();
     for (_, size, path) in files {
-        if total <= DISK_BUDGET {
+        if total <= budget {
             break;
         }
         if std::fs::remove_file(path).is_ok() {
@@ -167,6 +200,54 @@ fn prune(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dated_file(dir: &Path, name: &str, size: usize, time: std::time::SystemTime) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, vec![0; size]).unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_times(std::fs::FileTimes::new().set_modified(time)).unwrap();
+        path
+    }
+
+    #[test]
+    fn preview_budget_counts_current_and_other_versions_and_removes_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now();
+        let files: Vec<_> =
+            ["v1-old.dcpreview", "v2-old.dcpreview", "v3-old-renderer.dcpreview", "v3-current-renderer.dcpreview", "v12-future.dcpreview"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| dated_file(dir.path(), name, 4, now - std::time::Duration::from_secs(100 - i as u64)))
+                .collect();
+        let original = dated_file(dir.path(), "original.png", 100, now);
+        let unrelated = dated_file(dir.path(), "v-not-a-cache.dcpreview", 100, now);
+        prune_with_budget(dir.path(), 8, now);
+        assert!(files[..3].iter().all(|p| !p.exists()));
+        assert!(files[3..].iter().all(|p| p.exists()));
+        assert_eq!(files.iter().filter_map(|p| p.metadata().ok()).map(|m| m.len()).sum::<u64>(), 8);
+        assert!(original.exists() && unrelated.exists());
+    }
+
+    #[test]
+    fn preview_cleanup_reaps_abandoned_temps_without_touching_active_writes_or_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now();
+        let old = dated_file(dir.path(), "v3-renderer-1-0.123-0.tmp", 20, now - std::time::Duration::from_secs(24 * 60 * 60));
+        let active = dated_file(dir.path(), "v3-renderer-1-0.123-1.tmp", 20, now);
+        let unrelated = dated_file(dir.path(), "notes.tmp", 20, now - std::time::Duration::from_secs(48 * 60 * 60));
+        let folder = dir.path().join("v3-directory.dcpreview");
+        std::fs::create_dir(&folder).unwrap();
+        #[cfg(unix)]
+        let symlink = {
+            let target = dir.path().join("v3-link.dcpreview");
+            std::os::unix::fs::symlink(&unrelated, &target).unwrap();
+            target
+        };
+        prune_with_budget(dir.path(), 0, now);
+        assert!(!old.exists());
+        assert!(active.exists() && unrelated.exists() && folder.is_dir());
+        #[cfg(unix)]
+        assert!(symlink.symlink_metadata().unwrap().file_type().is_symlink());
+    }
 
     fn two_page_pdf() -> Arc<Vec<u8>> {
         let red = "1 0 0 rg 0 0 100 100 re f";
@@ -202,6 +283,12 @@ mod tests {
         let bytes = Arc::new(vec![1, 2, 3]);
         let pm = Pixmap::from_parts(vec![vello_cpu::color::PremulRgba8 { r: 10, g: 20, b: 30, a: 40 }; 4], 2, 2);
         store(&bytes, 1, 2, &pm);
+        assert_eq!(load(&bytes, 1, 2, (2, 2)).unwrap().data(), pm.data());
+        set_enabled(false);
+        assert!(load(&bytes, 1, 2, (2, 2)).is_none());
+        store(&bytes, 9, 2, &pm);
+        set_enabled(true);
+        assert!(!path(&bytes, 9, 2).unwrap().exists());
         assert_eq!(load(&bytes, 1, 2, (2, 2)).unwrap().data(), pm.data());
         assert!(load(&bytes, 0, 2, (2, 2)).is_none());
         assert!(load(&Arc::new(vec![1, 2, 4]), 1, 2, (2, 2)).is_none());
