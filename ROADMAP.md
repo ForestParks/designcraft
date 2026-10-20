@@ -347,6 +347,7 @@ list) · [roadmap.md](docs/roadmap.md) (milestones, plan) · [parity-checklist.m
 ## Progress log
 
 - **2026-10-20** · Preview-cache cleanup counts current and older cache versions toward its 512 MiB budget, removes the oldest previews first and reaps abandoned temporary files. Display Performance preferences can disable persistent image previews; privacy and safe cache clearing are documented. No readiness percentage change.
+- **2026-10-20** · Retain one current oversized print original instead of repeatedly decoding it, fit page thumbnails to the GPU texture limit, and apply the saved preview opt-out before startup cleanup. macOS saves and exits approved quits before window cleanup, while graphics errors return to the recovery handler. No readiness percentage change.
 
 - 2026-10-15: Bound decoded pixels and reusable disk previews; render thumbnails and coarse scrolling previews in the background, reuse eligible image-drag layers, cancel obsolete renders and validate GPU patch allocations. See docs/display-performance.md.
 

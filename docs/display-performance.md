@@ -7,8 +7,10 @@ These view choices do not reduce the resolution of original artwork or PDF expor
 Decoded artwork is shared between canvas and page-thumbnail renderers. Requested previews are
 looked up before loading full-resolution pixels; larger cached previews can supply smaller ones.
 The full-pixel cache has a 192 MiB budget, with a separate 96 MiB preview budget. Canvas and
-thumbnail renders trim old original pixels after drawing. Active renders can temporarily hold
-additional pixels; the budgets describe cache ownership, not a process memory limit. Closed
+thumbnail renders trim old original pixels after drawing. The most recently used original is
+retained even if it alone exceeds 192 MiB, so high-quality frames do not decode the same large
+print image repeatedly. Only one current original gets this exception; older originals evict.
+Active renders can temporarily hold additional pixels; these are cache targets, not a process memory limit. Closed
 files are not kept alive by the image cache.
 
 On desktop, disposable raster/PDF previews live in the profile's `Previews` directory (including
@@ -22,7 +24,7 @@ document or installed fonts. CLI and web have no disk cache unless a native host
 
 Disk previews can contain readable image and PDF-page content after the document closes.
 In **Preferences › Display Performance**, turn off **Save image previews on this computer**
-to stop using persistent previews; in-memory previews and export quality are unchanged.
+to stop using persistent previews, including startup cache cleanup; in-memory previews and export quality are unchanged.
 To clear existing disk previews, close all DesignCraft instances and delete only the `Previews`
 subfolder of the active profile. Default profiles are `~/Library/Application Support/DesignCraft`
 on macOS, `%APPDATA%/DesignCraft` on Windows, and `$XDG_CONFIG_HOME/designcraft` (or
@@ -76,8 +78,11 @@ Native canvas reuse also checks the texture pixel size at the current display sc
 monitor or UI-scale change refreshes the texture before partial updates; every patch must fit
 the actual GPU allocation. Logical viewport coverage alone does not establish pixel compatibility.
 
-On macOS the native app uses eframe's nonreturning event loop. Its save/on-exit hooks run before
-termination, avoiding a late AppKit Touch Bar observer exception after the final window closes.
+The native event loop returns its real result so graphics startup errors can follow the existing
+adapter/backend recovery path. On macOS an approved quit saves preferences and recovery, handles
+queued Finder documents, then explicitly exits from the exit hook before AppKit destroys the
+window. Pending or cancelled quit questions never take this path. Graphics errors return to the
+existing recovery handler. This avoids the late Touch Bar observer exception during window cleanup.
 Native validation covers presented GPU frames across UI-scale changes, editing and a clean exit.
 
 ## Scrolling previews

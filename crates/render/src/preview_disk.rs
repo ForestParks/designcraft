@@ -34,7 +34,9 @@ pub fn set_enabled(enabled: bool) {
 
 /// A native host supplies its cache directory. None disables persistence (CLI and web default).
 pub fn set_directory(directory: Option<PathBuf>) {
-    if let Some(dir) = &directory {
+    if ENABLED.load(Ordering::Relaxed)
+        && let Some(dir) = &directory
+    {
         prune(dir);
     }
     let mut disk = DISK.lock().unwrap_or_else(|e| e.into_inner());
@@ -287,7 +289,13 @@ mod tests {
         set_enabled(false);
         assert!(load(&bytes, 1, 2, (2, 2)).is_none());
         store(&bytes, 9, 2, &pm);
+        let abandoned =
+            dated_file(dir.path(), "v3-disabled.1-0.tmp", 20, std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 60 * 60));
+        set_directory(Some(dir.path().into()));
+        assert!(abandoned.exists(), "installing a directory while disabled must not clean up files");
         set_enabled(true);
+        set_directory(Some(dir.path().into()));
+        assert!(!abandoned.exists(), "enabled startup still cleans abandoned cache writes");
         assert!(!path(&bytes, 9, 2).unwrap().exists());
         assert_eq!(load(&bytes, 1, 2, (2, 2)).unwrap().data(), pm.data());
         assert!(load(&bytes, 0, 2, (2, 2)).is_none());

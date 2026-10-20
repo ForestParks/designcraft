@@ -40,6 +40,9 @@ pub struct Stats {
 #[derive(Default)]
 struct Cache {
     map: HashMap<Key, Entry>,
+    /// One current original may exceed the cache budget. Retaining it avoids decoding a
+    /// large print image again on every full-quality frame; older originals still evict.
+    current_original: Option<Key>,
     shapes: HashMap<(usize, u32), Shape>,
     clock: u64,
     /// Assets that failed to decode (don't retry every frame).
@@ -85,6 +88,9 @@ fn lookup(key: Key) -> Option<Arc<Pixmap>> {
     with(|c| {
         c.clock = c.clock.wrapping_add(1);
         let clock = c.clock;
+        if key.2 == 0 && c.map.get(&key).is_some_and(|e| e.owner.strong_count() > 0) {
+            c.current_original = Some(key);
+        }
         c.map.get_mut(&key).filter(|e| e.owner.strong_count() > 0).map(|e| {
             e.stamp = clock;
             if key.2 > 0 {
@@ -100,6 +106,7 @@ impl Cache {
         self.map.retain(|_, e| e.owner.strong_count() > 0);
         self.shapes.retain(|_, e| e.owner.strong_count() > 0);
         self.bad.retain(|_, e| e.1.strong_count() > 0);
+        self.current_original = self.current_original.filter(|key| self.map.contains_key(key));
         for (original, budget) in [(true, full), (false, previews)] {
             let mut entries: Vec<_> = self.map.iter().filter(|(k, _)| (k.2 == 0) == original).map(|(k, e)| (e.stamp, *k, size_of(&e.pm))).collect();
             let mut size: usize = entries.iter().map(|e| e.2).fold(0usize, usize::saturating_add);
@@ -107,6 +114,9 @@ impl Cache {
             for (_, key, n) in entries {
                 if size <= budget {
                     break;
+                }
+                if original && self.current_original == Some(key) {
+                    continue;
                 }
                 self.map.remove(&key);
                 size = size.saturating_sub(n);
@@ -120,6 +130,9 @@ fn store(bytes: &Arc<Vec<u8>>, page: u32, level: u8, pm: Arc<Pixmap>) {
     with(|c| {
         c.clock = c.clock.wrapping_add(1);
         c.map.insert((Arc::as_ptr(bytes) as usize, page, level), Entry { owner: Arc::downgrade(bytes), pm, stamp: c.clock });
+        if level == 0 {
+            c.current_original = Some((Arc::as_ptr(bytes) as usize, page, level));
+        }
         c.prune(FULL_BUDGET, PREVIEW_BUDGET);
     });
 }
@@ -330,6 +343,34 @@ mod preview_tests {
         assert!(!cache.map.contains_key(&(1, 0, 0)));
         assert!(cache.map.contains_key(&(1, 0, 2)));
         assert_eq!(cache.stats.decoded_bytes, 256);
+    }
+
+    #[test]
+    fn oversized_current_original_survives_trim_and_preview_insertion() {
+        // Use a tiny budget to reproduce a print original larger than FULL_BUDGET.
+        let owner = Arc::new(vec![7]);
+        let mut cache = Cache::default();
+        let entry = |stamp| Entry { owner: Arc::downgrade(&owner), pm: Arc::new(Pixmap::new(8, 8)), stamp };
+        cache.map.insert((1, 0, 0), entry(1));
+        cache.map.insert((2, 0, 0), entry(2));
+        cache.current_original = Some((2, 0, 0));
+        let current = cache.map[&(2, 0, 0)].pm.clone();
+        cache.prune(128, 256);
+        assert!(!cache.map.contains_key(&(1, 0, 0)));
+        assert!(Arc::ptr_eq(&cache.map[&(2, 0, 0)].pm, &current));
+        cache.map.insert((2, 0, 1), entry(3));
+        cache.prune(128, 256);
+        assert!(Arc::ptr_eq(&cache.map[&(2, 0, 0)].pm, &current), "preview insertion and trimming must not evict the current original");
+        cache.map.insert((3, 0, 0), entry(4));
+        cache.current_original = Some((3, 0, 0));
+        cache.prune(128, 256);
+        assert!(!cache.map.contains_key(&(2, 0, 0)), "a different original replaces the oversized exception");
+        assert!(cache.map.contains_key(&(3, 0, 0)));
+        assert!(cache.map.contains_key(&(2, 0, 1)), "preview budget remains independent");
+        drop(owner);
+        cache.prune(128, 256);
+        assert!(cache.map.is_empty());
+        assert!(cache.current_original.is_none());
     }
 }
 

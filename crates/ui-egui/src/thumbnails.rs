@@ -166,7 +166,10 @@ impl Thumbnails {
             }
             self.textures.insert(
                 done.key,
-                (ctx.load_texture(format!("page-thumb-{}-{}", self.uid, done.key.page), ci, egui::TextureOptions::LINEAR), self.clock),
+                (
+                    crate::widgets::load_texture(ctx, format!("page-thumb-{}-{}", self.uid, done.key.page), ci, egui::TextureOptions::LINEAR),
+                    self.clock,
+                ),
             );
             self.rendered = self.rendered.saturating_add(1);
         } else {
@@ -251,5 +254,24 @@ mod tests {
             assert_eq!((image.width, image.height), (height * 2, height));
             assert_eq!(image.pixel(height, height / 2), [255, 255, 255, 255]);
         }
+    }
+
+    #[test]
+    fn wide_page_thumbnail_fits_the_gpu_texture_limit() {
+        let ctx = egui::Context::default();
+        // egui's font atlas requires at least 1024 pixels; exceed that supported
+        // limit with a wide document rather than making the context invalid.
+        let mut input = egui::RawInput { max_texture_side: Some(1024), ..Default::default() };
+        let mut thumbs = Thumbnails { generation: 1, pending: true, ..Default::default() };
+        let doc = Arc::new(Document::new(&NewDocument { width: 6000.0, height: 100.0, facing_pages: false, ..Default::default() }));
+        let done = render(Job { generation: 1, key: Key { page: 0, height: 32 }, doc, cache: Arc::new(Cache::new()) });
+        assert_eq!(done.image.as_ref().unwrap().width, 1920);
+        let mut done = Some(done);
+        let mut output = ctx.run_ui(std::mem::take(&mut input), |ui| thumbs.accept(done.take().unwrap(), ui.ctx()));
+        output.textures_delta.clear();
+        let texture = thumbs.get(0, 32).unwrap();
+        assert_eq!(texture.size(), [1024, 17]);
+        assert_eq!(thumbs.rendered, 1);
+        assert!(!thumbs.pending);
     }
 }
