@@ -59,6 +59,10 @@ Recovery, clipboard/snippets and `file.serialize` remain self-contained. Byte-on
 (`file.openBytes`, including the web app) has no project folder from which to resolve external
 files, so it keeps any embedded data and warns about unresolved artwork instead of reading
 paths supplied inside a document. The Links panel option is disabled on the web.
+Linked-only saves of a byte-opened layout with unresolved relative references are refused:
+use Relink to supply their original paths first. A save destination is never their source folder.
+Package resolves missing relative references against the source layout before moving the copy,
+so an unrelated file in the package folder cannot replace missing artwork.
 
 Working files that omit linked originals use native format 4. Portable or complete working files
 keep the older embedded format even when linked mode is selected. Older applications must ask for an update

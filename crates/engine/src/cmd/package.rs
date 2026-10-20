@@ -386,7 +386,9 @@ fn package(s: &mut Session, p: &Value) -> Result<Value> {
     let fonts = s.execute("font.list", &json!({}))?;
     let links = s.execute("links.list", &json!({}))?;
     let pre = s.execute("preflight.run", &json!({})).unwrap_or(Value::Null);
-    let d = s.doc()?.doc.clone();
+    let st = s.doc()?;
+    let mut d = (*st.doc).clone();
+    super::native_links::prepare_paths(&mut d, st.path.as_deref().map(Path::new))?;
     let links_dir = root.child("Links")?;
     let (packed, mut files) = write_links(&d, &root, &links_dir, None)?;
     let doc_path = package_output_path(&dir, &title, "designcraft")?;

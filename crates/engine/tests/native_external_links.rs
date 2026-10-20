@@ -210,6 +210,66 @@ fn portable_serialization_keeps_originals_and_open_bytes_never_reads_external_pa
 }
 
 #[test]
+fn byte_opened_relative_links_cannot_adopt_artwork_from_a_save_destination() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut original, _, _) = setup(temp.path());
+    let source = temp.path().join("source.designcraft");
+    original.execute("file.saveAs", &json!({"path": source, "embedImages": false})).unwrap();
+    let bytes = std::fs::read(source).unwrap();
+    let destination = temp.path().join("elsewhere");
+    std::fs::create_dir_all(destination.join("Links")).unwrap();
+    std::fs::write(destination.join("Links/art.png"), png(2)).unwrap();
+    let path = destination.join("copy.designcraft");
+    std::fs::write(&path, b"previous file").unwrap();
+    let mut session = Session::new();
+    session.execute("file.openBytes", &json!({"base64": designcraft_engine::cmd::base64_encode(&bytes)})).unwrap();
+    let before = session.doc().unwrap().clone();
+    for command in ["file.saveAs", "file.saveACopy"] {
+        let error = session.execute(command, &json!({"path": path})).unwrap_err().to_string();
+        assert!(error.contains("no source document folder"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous file");
+        assert!(Arc::ptr_eq(&before.doc, &session.doc().unwrap().doc));
+        assert_eq!(session.doc().unwrap().path, None);
+    }
+    assert!(session.doc().unwrap().doc.assets.values().all(|asset| asset.data.is_empty()));
+}
+
+#[test]
+fn packaging_missing_relative_links_keeps_the_source_document_folder() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_dir = temp.path().join("source");
+    std::fs::create_dir(&source_dir).unwrap();
+    let (mut original, source, _) = setup(&source_dir);
+    // A legacy embedded-mode layout can retain a missing relative reference. Turning on
+    // linked storage must give Package the same source context as Save As.
+    let mut doc = (*original.doc().unwrap().doc).clone();
+    for asset in doc.assets.values_mut() {
+        let asset = Arc::make_mut(asset);
+        asset.link = Some("Links/art.png".into());
+        asset.data = Arc::new(Vec::new());
+    }
+    let path = source_dir.join("layout.designcraft");
+    std::fs::write(&path, designcraft_format::save(&doc).unwrap()).unwrap();
+    std::fs::remove_file(&source).unwrap();
+    original.execute("file.open", &json!({"path": path})).unwrap();
+    original.execute("links.storage", &json!({"mode": "linked"})).unwrap();
+    let package = temp.path().join("package");
+    std::fs::create_dir_all(package.join("Links")).unwrap();
+    let unrelated = png(2);
+    std::fs::write(package.join("Links/art.png"), &unrelated).unwrap();
+    let result = original.execute("file.package", &json!({"dir": package, "idml": false})).unwrap();
+    let document = result["files"].as_array().unwrap().iter().filter_map(Value::as_str).find(|p| p.ends_with(".designcraft")).unwrap();
+    assert!(result["report"].as_str().unwrap().contains("missing"));
+    let mut reopened = Session::new();
+    let opened = reopened.execute("file.open", &json!({"path": document})).unwrap();
+    assert_eq!(opened["warnings"].as_array().unwrap().len(), 1);
+    let asset = reopened.doc().unwrap().doc.assets.values().next().unwrap();
+    assert!(asset.data.is_empty());
+    assert_eq!(Path::new(asset.link.as_deref().unwrap()), source);
+    assert_eq!(std::fs::read(package.join("Links/art.png")).unwrap(), unrelated);
+}
+
+#[test]
 fn storage_choice_is_undoable_and_rejects_invalid_input() {
     let mut session = Session::new();
     session.execute("file.new", &json!({})).unwrap();

@@ -67,6 +67,14 @@ pub(super) fn prepare_paths(saved: &mut Document, document: Option<&Path>) -> Re
                 continue;
             }
             let Some(link) = asset.link.as_deref() else { continue };
+            // Byte-opened layouts have no source folder. Giving a relative reference the
+            // destination's folder would let a later reopen adopt unrelated artwork there.
+            if document.is_none() && craft_docpath::resolve(link, None).is_ok_and(|path| !path.is_absolute()) {
+                return Err(bad(
+                    "file.save",
+                    format!("{}: relative artwork has no source document folder; Relink it before saving links only", asset.name),
+                ));
+            }
             match crate::io::document_path(link, document) {
                 Ok(source) => Arc::make_mut(asset).link = Some(source.to_string_lossy().into_owned()),
                 Err(why) if !asset.data.is_empty() => {
