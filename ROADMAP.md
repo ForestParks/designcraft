@@ -347,8 +347,9 @@ list) · [roadmap.md](docs/roadmap.md) (milestones, plan) · [parity-checklist.m
 ## Progress log
 
 - **2026-10-20** · The Links panel warns before linked-only storage is selected that moving, deleting or changing originals can leave artwork missing or changed. Package and Embed guidance explains how to retain the originals. No readiness percentage change.
+- **2026-10-20** · Book numbering keeps chapters usable when linked artwork is missing. Linked PDF assets retain distinct visible crop boxes during compaction, and portable or complete saves keep the older embedded format. No readiness percentage change.
 
-- 2026-10-15: Add opt-in linked-only native working saves, relative source hydration within automation roots, and legacy first-baseline compatibility; portable recovery retains originals. See docs/linked-artwork.md.
+- **2026-10-15** · Add opt-in linked-only native working saves, load relative sources from permitted folders, and preserve legacy first-baseline compatibility; portable recovery retains originals. See docs/linked-artwork.md.
 
 Newest first.
 

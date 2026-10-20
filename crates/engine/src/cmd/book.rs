@@ -62,9 +62,8 @@ fn load(path: &str) -> Result<designcraft_doc::Document> {
             .map_err(|e| EngineError::Other(format!("{path}: {e}")));
     }
     let mut doc = super::file::from_bytes(&bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
-    let warnings = super::native_links::resolve(&mut doc, Some(std::path::Path::new(path)));
-    if !warnings.is_empty() {
-        return Err(EngineError::Other(format!("{path}: {}", warnings.join("; "))));
+    for warning in super::native_links::resolve(&mut doc, Some(std::path::Path::new(path))) {
+        log::warn!("{path}: {warning}");
     }
     Ok(doc)
 }

@@ -112,9 +112,10 @@ fn save_with_assets(doc: &Document, preview: Option<&[u8]>, embed_links: bool, l
         z.start_file("meta.json", deflate).map_err(io)?;
         // Readers must understand every feature present before they can safely save a file.
         // EPS source stays at upstream's v3; external links and legacy baselines need newer readers.
+        let omits_links = !embed_links && doc.assets.values().any(|a| a.link.is_some() && a.is_linkable_graphic());
         let version = if legacy_baselines(doc) {
             VERSION
-        } else if doc.settings.external_links {
+        } else if omits_links {
             4
         } else if doc.assets.values().any(|a| designcraft_images::is_eps(&a.data)) {
             3
@@ -505,6 +506,50 @@ mod tests {
         assert_eq!(portable.assets[&linked].data.as_slice(), &[7; 4096]);
         assert_eq!(portable.assets[&embedded].data.as_slice(), &[8; 4096]);
         assert!(!doc.assets[&linked].data.is_empty(), "saving never discards the live original");
+    }
+
+    fn archive_version(bytes: &[u8]) -> u64 {
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let meta: Value = serde_json::from_reader(zip.by_name("meta.json").unwrap()).unwrap();
+        meta["version"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn portable_and_complete_linked_mode_saves_use_the_older_format() {
+        let mut doc = Document::new(&NewDocument::default());
+        doc.settings.external_links = true;
+        assert_eq!(archive_version(&save_working(&doc).unwrap()), 2, "no linked originals are omitted");
+        let id = png_asset(&mut doc, &[7; 128]);
+        Arc::make_mut(doc.assets.get_mut(&id).unwrap()).link = Some("Links/art.png".into());
+        place(&mut doc, id, 0.0);
+        let portable = save(&doc).unwrap();
+        assert_eq!(archive_version(&portable), 2, "portable files include their original artwork");
+        assert_eq!(asset_entries(&portable), 1);
+        assert_eq!(archive_version(&save_working(&doc).unwrap()), 4);
+        Arc::make_mut(doc.assets.get_mut(&id).unwrap()).link = None;
+        assert_eq!(archive_version(&save_working(&doc).unwrap()), 2);
+    }
+
+    #[test]
+    fn linked_pdf_crop_boxes_survive_working_save_compaction() {
+        let mut doc = Document::new(&NewDocument::default());
+        doc.settings.external_links = true;
+        let boxes = [[0.0, 0.0, 0.5, 1.0], [0.5, 0.0, 1.0, 1.0], [0.0, 0.0, 0.5, 1.0]];
+        for (n, crop) in boxes.into_iter().enumerate() {
+            let id = png_asset(&mut doc, b"%PDF-synthetic");
+            let asset = Arc::make_mut(doc.assets.get_mut(&id).unwrap());
+            asset.mime = "application/pdf".into();
+            asset.link = Some("Links/spread.pdf".into());
+            asset.pdf_box = Some(crop);
+            place(&mut doc, id, n as f64);
+        }
+        let working = save_working(&doc).unwrap();
+        assert_eq!(asset_entries(&working), 0);
+        let reopened = load(&working).unwrap();
+        assert_eq!(reopened.assets.len(), 2, "matching boxes still merge, distinct visible boxes stay separate");
+        for crop in [boxes[0], boxes[1]] {
+            assert!(reopened.assets.values().any(|a| a.pdf_box == Some(crop) && a.data.is_empty()));
+        }
     }
 
     /// Zip `d` the way files were saved with one asset per placement (nothing merged or pruned).

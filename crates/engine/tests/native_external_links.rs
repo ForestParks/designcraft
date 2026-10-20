@@ -37,6 +37,25 @@ fn assets(path: &Path) -> usize {
 }
 
 #[test]
+fn book_numbering_keeps_chapters_with_missing_linked_artwork_usable() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut session, source, _) = setup(temp.path());
+    let chapter = temp.path().join("chapter.designcraft");
+    session.execute("file.saveAs", &json!({"path": chapter, "embedImages": false})).unwrap();
+    session.execute("file.close", &json!({})).unwrap();
+    let original_assets = archive(&chapter).1["assets"].clone();
+    assert!(!original_assets.is_null());
+    std::fs::remove_file(source).unwrap();
+    session.execute("book.new", &json!({"path": temp.path().join("layout.dcbook")})).unwrap();
+    session.execute("book.add", &json!({"path": chapter})).unwrap();
+    assert_eq!(session.execute("book.paginate", &json!({})).unwrap()["pages"], 1);
+    assert_eq!(assets(&chapter), 0);
+    assert_eq!(archive(&chapter).1["assets"], original_assets, "numbering must retain unresolved artwork references");
+    session.execute("file.open", &json!({"path": chapter})).unwrap();
+    assert_eq!(session.execute("links.list", &json!({})).unwrap()[0]["status"], "missing");
+}
+
+#[test]
 fn native_working_links_obey_automation_read_roots() {
     use designcraft_engine::file_access::{AutomationRoots, confine};
     let temp = tempfile::tempdir().unwrap();

@@ -60,8 +60,9 @@ Recovery, clipboard/snippets and `file.serialize` remain self-contained. Byte-on
 files, so it keeps any embedded data and warns about unresolved artwork instead of reading
 paths supplied inside a document. The Links panel option is disabled on the web.
 
-External-link working files use native format 4. Older applications must ask for an update
-rather than open the layout with silently missing artwork. Ordinary embedded files remain
+Working files that omit linked originals use native format 4. Portable or complete working files
+keep the older embedded format even when linked mode is selected. Older applications must ask for an update
+for a format-4 file rather than open it with silently missing artwork. Ordinary embedded files remain
 format 2 (format 3 when retaining EPS originals); opening older files never converts them to external storage automatically.
 
 Native format 1 layouts retain their original first-baseline calculations when opened. Saves
