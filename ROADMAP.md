@@ -346,6 +346,8 @@ list) · [roadmap.md](docs/roadmap.md) (milestones, plan) · [parity-checklist.m
 
 ## Progress log
 
+- **2026-10-21** · Retained drags paint document grids once in their original stacking order. CMYK ink passes start with identical slice state, and unchanged CMYK views reuse cached pixels across job generations while cancelled jobs still return no pixels. Synthetic regressions cover moved composites, sliced ink passes and cache invalidation. No readiness percentage change.
+
 - **2026-10-21** · Retained image drags preserve Bleed and Slug preview extents; small canvas edits apply the same proof and ink-limit transforms as full redraws. Cancelled renders clear completed CMYK-pass state and cannot populate the view cache. No readiness percentage change.
 
 - **2026-10-20** · Preview-cache cleanup counts current and older cache versions toward its 512 MiB budget, removes the oldest previews first and reaps abandoned temporary files. Display Performance preferences can disable persistent image previews; privacy and safe cache clearing are documented. No readiness percentage change.

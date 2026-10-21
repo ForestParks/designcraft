@@ -370,7 +370,9 @@ impl Renderer {
         let start = now();
         RICH_BLACK.with(|r| r.set(opts.rich_black));
         PLATE.with(|p| p.set(opts.plate));
-        if let Some(hit) = self.cmyk_view.as_ref().filter(|entry| entry.matches(doc, spreads, width, height, view, opts, self.threads)) {
+        if let Some(hit) =
+            self.cmyk_view.as_ref().filter(|entry| !opts.cancelled() && entry.matches(doc, spreads, width, height, view, opts, self.threads))
+        {
             let image = hit.image();
             self.stats = hit.stats();
             self.stats.micros = now().saturating_sub(start);
@@ -496,13 +498,7 @@ impl Renderer {
         let doc = f.doc;
         let Some(sp) = doc.spread(sr) else { return };
         // Paper.
-        if f.opts.paper
-            && f.opts.slice.is_none_or(|s| match s.part {
-                SlicePart::Before => !self.slice_seen,
-                SlicePart::Item => false,
-                SlicePart::After => self.slice_seen,
-            })
-        {
+        if f.opts.paper && self.slice_includes_surrounding(f.opts) {
             let paper = doc.resolve_color(designcraft_color::swatch::PAPER, 1.0).unwrap_or(designcraft_color::Color::WHITE);
             if f.opts.page_shadow {
                 ctx.set_transform(f.view);
@@ -525,12 +521,12 @@ impl Renderer {
         }
         let grid_area = f.opts.document_grid.iter().find(|(r, _)| *r == sr).map(|(_, a)| *a);
         let grid = &doc.settings.grid;
-        if let Some(area) = grid_area.filter(|_| grid.in_back) {
+        if let Some(area) = grid_area.filter(|_| grid.in_back && self.slice_includes_surrounding(f.opts)) {
             grid::draw(ctx, f, sp, grid, area);
         }
         if blendspace::uses_cmyk(doc, sr, f.opts) {
             self.draw_cmyk_spread(ctx, f, sr);
-            if let Some(area) = grid_area.filter(|_| !grid.in_back) {
+            if let Some(area) = grid_area.filter(|_| !grid.in_back && self.slice_includes_surrounding(f.opts)) {
                 grid::draw(ctx, f, sp, grid, area);
             }
             return;
@@ -587,9 +583,19 @@ impl Renderer {
         if isolate {
             ctx.pop_layer();
         }
-        if let Some(area) = grid_area.filter(|_| !grid.in_back) {
+        if let Some(area) = grid_area.filter(|_| !grid.in_back && self.slice_includes_surrounding(f.opts)) {
             grid::draw(ctx, f, sp, grid, area);
         }
+    }
+
+    /// Paper and grids stay in the surrounding slice at their position in paint order.
+    /// They never move with the selected item.
+    fn slice_includes_surrounding(&self, opts: &RenderOptions) -> bool {
+        opts.slice.is_none_or(|slice| match slice.part {
+            SlicePart::Before => !self.slice_seen,
+            SlicePart::Item => false,
+            SlicePart::After => self.slice_seen,
+        })
     }
 
     fn draw_root(&mut self, ctx: &mut RenderContext, f: &Frame, it: &Item, parent: Affine, page: ShownOn) {
@@ -1715,6 +1721,85 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn retained_grid_layers_match_a_moved_full_redraw_in_rgb_and_cmyk() {
+        for blend_space in [designcraft_doc::BlendSpace::Rgb, designcraft_doc::BlendSpace::Cmyk] {
+            for in_back in [true, false] {
+                let mut doc = Document::new(&NewDocument { width: 96.0, height: 80.0, facing_pages: false, ..Default::default() });
+                doc.settings.blend_space = blend_space;
+                doc.settings.grid.in_back = in_back;
+                doc.settings.grid.vertical = 24.0;
+                doc.settings.grid.horizontal = 24.0;
+                doc.settings.grid.subdivisions = 3;
+                let item = designcraft_doc::ItemId(doc.alloc());
+                let mut moved = Item::new(
+                    item,
+                    doc.default_layer(),
+                    designcraft_doc::Shape::Rectangle,
+                    designcraft_geom::shapes::rectangle(Rect::new(12.0, 12.0, 54.0, 48.0)),
+                );
+                moved.fill = Fill::swatch("C=100 M=0 Y=0 K=0");
+                doc.insert_item(SpreadRef::Doc(0), moved, None).unwrap();
+                // A separate blended object exercises the CMYK path without making the
+                // selected item's appearance depend on its backdrop.
+                let other = designcraft_doc::ItemId(doc.alloc());
+                let mut fixed = Item::new(
+                    other,
+                    doc.default_layer(),
+                    designcraft_doc::Shape::Rectangle,
+                    designcraft_geom::shapes::rectangle(Rect::new(76.0, 60.0, 90.0, 75.0)),
+                );
+                fixed.fill = Fill::swatch(designcraft_color::swatch::BLACK);
+                fixed.blend = designcraft_color::BlendMode::Multiply;
+                doc.insert_item(SpreadRef::Doc(0), fixed, None).unwrap();
+                let options = RenderOptions {
+                    blend_space_view: true,
+                    document_grid: vec![(SpreadRef::Doc(0), Rect::new(0.0, 0.0, 96.0, 80.0))],
+                    ..Default::default()
+                };
+                let cache = Cache::new();
+                let placed = [Placed { spread: SpreadRef::Doc(0), xf: Affine::IDENTITY }];
+                let mut renderer = Renderer::new();
+                renderer.threads = 0;
+                let images: Vec<_> = [SlicePart::Before, SlicePart::Item, SlicePart::After]
+                    .into_iter()
+                    .map(|part| {
+                        renderer.render(
+                            &doc,
+                            &cache,
+                            &placed,
+                            96,
+                            80,
+                            Affine::IDENTITY,
+                            &RenderOptions { slice: Some(DrawSlice { item, part }), ..options.clone() },
+                        )
+                    })
+                    .collect();
+                doc.item_mut(item).unwrap().xf = Affine::translate((7.0, 5.0));
+                let full = renderer.render(&doc, &cache, &placed, 96, 80, Affine::IDENTITY, &options);
+                for y in 0..80usize {
+                    for x in 0..96usize {
+                        let mut pixel = [0u8; 4];
+                        for (index, image) in images.iter().enumerate() {
+                            let (sx, sy) = if index == 1 { (x.checked_sub(7), y.checked_sub(5)) } else { (Some(x), Some(y)) };
+                            let (Some(sx), Some(sy)) = (sx, sy) else { continue };
+                            let source = &image.pixels[(sy * 96 + sx) * 4..(sy * 96 + sx) * 4 + 4];
+                            for channel in 0..4 {
+                                pixel[channel] =
+                                    (source[channel] as u32 + (pixel[channel] as u32 * (255 - source[3] as u32) + 127) / 255).min(255) as u8;
+                            }
+                        }
+                        let expected = full.pixel(x as u32, y as u32);
+                        assert!(
+                            pixel.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 2),
+                            "{blend_space:?}, back={in_back}, {x},{y}: {pixel:?} vs {expected:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn cancelled_background_render_does_not_publish_partial_pixels_or_poison_next_render() {
         let doc = Document::new(&NewDocument::default());
