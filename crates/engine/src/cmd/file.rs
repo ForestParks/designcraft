@@ -478,7 +478,7 @@ fn open_path(s: &mut Session, p: &Value) -> Result<Value> {
             return Err(bad("file.open", format!("{path}: not a DesignCraft or IDML file")));
         }
         let (mut d, mut warnings) = load_bytes(&bytes)?;
-        super::interchange::resolve_packaged_links(&mut d, std::path::Path::new(path).parent());
+        super::interchange::resolve_packaged_links(&mut d, Some(std::path::Path::new(path)));
         super::datamerge::resolve_sources_on_open(&mut d, Some(std::path::Path::new(path)));
         let (fonts, faces, font_warnings) = load_document_fonts(&mut d, path);
         warnings.extend(font_warnings);
@@ -629,6 +629,9 @@ fn file_place(s: &mut Session, p: &Value) -> Result<Value> {
         })
         .transpose()?;
     // Image Import Options: which page of a PDF (1-based).
+    if designcraft_render::is_pdf(&bytes) {
+        designcraft_render::check_pdf_input_size(bytes.len()).map_err(|e| bad("file.place", e.to_string()))?;
+    }
     let pdf_page = match p.get("pdfPage").and_then(Value::as_u64) {
         Some(n) if designcraft_render::is_pdf(&bytes) => {
             let count = designcraft_render::pdf_page_count(&bytes).unwrap_or(1);
@@ -948,7 +951,7 @@ fn snippet_export(s: &mut Session, p: &Value) -> Result<Value> {
 fn place_layout_page(s: &mut Session, p: &Value, name: &str, bytes: &[u8]) -> Result<Value> {
     const ID: &str = "file.place";
     let src = if name.to_lowercase().ends_with(".idml") {
-        super::interchange::import_idml_confined(bytes).map_err(|e| bad(ID, e.to_string()))?
+        super::interchange::import_idml_confined(bytes, str_param(p, "path").map(std::path::Path::new)).map_err(|e| bad(ID, e.to_string()))?
     } else {
         from_bytes(bytes)?
     };
@@ -1073,7 +1076,7 @@ fn file_revert(s: &mut Session, _: &Value) -> Result<Value> {
     {
         let mut d = if path.to_ascii_lowercase().ends_with(".idml") {
             let bytes = crate::io::read_file(&path).map_err(EngineError::Other)?;
-            super::interchange::import_idml_confined(&bytes).map_err(|e| EngineError::Other(e.to_string()))?
+            super::interchange::import_idml_confined(&bytes, Some(std::path::Path::new(&path))).map_err(|e| EngineError::Other(e.to_string()))?
         } else {
             from_bytes(&crate::io::read_file(&path).map_err(EngineError::Other)?)?
         };

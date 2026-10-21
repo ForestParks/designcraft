@@ -7,10 +7,16 @@
 //!
 //! A linked text file (File › Place with Create Links) remembers its file's size and hash on the
 //! story instead; updating it imports the file again into the story.
+//!
+//! A link is followed only where [`crate::io::document_path`] allows it, resolved against the
+//! document's own file; a refused link is missing, with the reason in `links.list`.
 
+use std::path::Path;
 use std::sync::Arc;
 
-use designcraft_doc::{AssetId, Content, Document, Fingerprint, ItemId, Selection, Story, StoryId, TextFileLink};
+use designcraft_compose::Cache;
+use designcraft_doc::{AssetId, Content, Document, Fingerprint, Item, ItemId, Selection, Story, StoryId, TextFileLink};
+use designcraft_geom::Affine;
 use serde_json::{Value, json};
 
 use super::{CommandSpec, bad, cmd, has_doc, str_param};
@@ -18,10 +24,10 @@ use crate::{EngineError, Result, Session};
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
-        cmd!(query "links.list", "Links", [], None, "{} → [{asset, name, path, status: ok|modified|missing|embedded, pixels, pdfCrop (placed PDFs: the box shown), uses: [{id, page, ppi}]}], then linked text files: [{story, name, path, status (also tooLarge: unchanged size, too big to check), edited (the story was changed in the layout), uses: [{id, page}]}]", has_doc, |s, _| {
+        cmd!(query "links.list", "Links", [], None, "{} → [{asset, name, path, status: ok|modified|missing|embedded, refused?: why a missing link isn't followed (a path on another computer, a device), pixels, pdfCrop (placed PDFs: the box shown), uses: [{id, page, ppi}]}], then linked text files: [{story, name, path, status (also tooLarge: unchanged size, too big to check), edited (the story was changed in the layout), uses: [{id, page}]}]", has_doc, |s, _| {
             // Taken out for the call so the document needn't be cloned on every poll.
             let mut checks = std::mem::take(&mut s.text_link_checks);
-            let links = s.doc().map(|d| list(&d.doc, &mut checks));
+            let links = s.doc().map(|d| list(&d.doc, &s.cache, d.path.as_deref().map(Path::new), &mut checks));
             s.text_link_checks = checks;
             Ok(Value::Array(links?))
         }),
@@ -126,31 +132,47 @@ fn uses(d: &Document, aid: AssetId) -> Vec<ItemId> {
     out
 }
 
+/// Why a link stored in the document at `document` isn't followed, if it isn't.
+pub fn refused(link: &str, document: Option<&Path>) -> Option<crate::io::Refused> {
+    crate::io::document_path(link, document).err()
+}
+
 /// Whether an asset's linked file is gone ([`status`] "missing" without reading the file). An
-/// asset can hold data while its file is missing: the document's preview of it.
-pub fn link_missing(a: &designcraft_doc::Asset) -> bool {
-    let Some(path) = &a.link else { return false };
+/// asset can hold data while its file is missing: the document's preview of it. `document` is
+/// the document's file, which relative links are resolved against.
+pub fn link_missing(a: &designcraft_doc::Asset, document: Option<&Path>) -> bool {
+    let Some(link) = &a.link else { return false };
     #[cfg(not(target_arch = "wasm32"))]
     {
-        !crate::io::exists(path)
+        crate::io::document_path(link, document).map_or(true, |path| !crate::io::exists(path))
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = path;
+        let _ = (link, document);
         false
     }
 }
 
-/// Link status of an asset.
-pub fn status(a: &designcraft_doc::Asset) -> &'static str {
-    let Some(path) = &a.link else { return "embedded" };
+/// Link status of an asset in the document at `document`. Only a regular file is compared, so a
+/// link to a device (`/dev/zero`) or a FIFO is missing rather than read.
+pub fn status(a: &designcraft_doc::Asset, document: Option<&Path>) -> &'static str {
+    let Some(link) = &a.link else { return "embedded" };
+    // Nothing was read from the file (a package's link that wasn't followed): missing, as in
+    // Preflight.
+    if a.data.is_empty() {
+        return "missing";
+    }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        match crate::io::metadata(path) {
+        let Ok(path) = crate::io::document_path(link, document) else { return "missing" };
+        if !crate::io::is_file(&path) {
+            return "missing";
+        }
+        match crate::io::metadata(&path) {
             Err(_) => "missing",
             Ok(m) if m.len() as usize != a.data.len() => "modified",
             // Same size: compare the bytes (cheap for the sizes involved, and exact).
-            Ok(_) => match crate::io::read_file(path) {
+            Ok(_) => match crate::io::read_capped(&path, a.data.len() as u64) {
                 Ok(b) if b == *a.data => "ok",
                 Ok(_) => "modified",
                 Err(_) => "missing",
@@ -159,7 +181,7 @@ pub fn status(a: &designcraft_doc::Asset) -> &'static str {
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = path;
+        let _ = (link, document);
         "ok"
     }
 }
@@ -196,14 +218,15 @@ pub(crate) type TextChecks = std::collections::HashMap<String, (Fingerprint, Str
 /// Link status of a linked text file: `tooLarge` when it is the recorded size but over
 /// [`MAX_TEXT_LINK_BYTES`], so its contents aren't checked. The file is read only when its size
 /// is the recorded one but its time isn't, and then once per new time (`checks`): a file saved
-/// or synced again without changes stays OK.
-pub(crate) fn text_status(l: &TextFileLink, checks: &mut TextChecks) -> &'static str {
+/// or synced again without changes stays OK. `document` is the document's file.
+pub(crate) fn text_status(l: &TextFileLink, checks: &mut TextChecks, document: Option<&Path>) -> &'static str {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        if !crate::io::is_file(&l.path) {
+        let Ok(path) = crate::io::document_path(&l.path, document) else { return "missing" };
+        if !crate::io::is_file(&path) {
             return "missing";
         }
-        let now = match crate::io::metadata(&l.path) {
+        let now = match crate::io::metadata(&path) {
             Err(_) => return "missing",
             Ok(m) => super::datamerge::fingerprint_from(&m),
         };
@@ -216,7 +239,7 @@ pub(crate) fn text_status(l: &TextFileLink, checks: &mut TextChecks) -> &'static
         let hash = match checks.get(&l.path) {
             Some((at, hash)) if *at == now => hash.clone(),
             _ if now.size > MAX_TEXT_LINK_BYTES => return "tooLarge",
-            _ => match read_text(&l.path) {
+            _ => match read_text(&path) {
                 Ok((b, at)) => {
                     let hash = fnv_hex(&b);
                     // The time from before the read: a change during it is seen next time.
@@ -232,7 +255,7 @@ pub(crate) fn text_status(l: &TextFileLink, checks: &mut TextChecks) -> &'static
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (l, checks);
+        let _ = (l, checks, document);
         "ok"
     }
 }
@@ -241,40 +264,93 @@ fn file_name(path: &str) -> String {
     std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string())
 }
 
-fn list(d: &Document, checks: &mut TextChecks) -> Vec<Value> {
+/// A graphic showing an asset: the item, its page, and the transform from its parent's space to
+/// the spread.
+struct Shown<'a> {
+    item: &'a Item,
+    page: Option<usize>,
+    parent_xf: Affine,
+}
+
+/// Where an asset shows: frames on spreads (see [`uses`]) and anchored or inline objects, whose
+/// page and position come from the frame their story lays them out in.
+fn shown<'a>(d: &'a Document, cache: &Cache, aid: AssetId) -> Vec<Shown<'a>> {
+    fn walk<'a>(it: &'a Item, xf: Affine, aid: AssetId, page: Option<usize>, out: &mut Vec<Shown<'a>>) {
+        if let Content::Graphic(g) = &it.content
+            && g.asset == aid
+        {
+            out.push(Shown { item: it, page, parent_xf: xf });
+        }
+        for c in it.children() {
+            walk(c, xf * it.xf, aid, page, out);
+        }
+    }
+    let mut out: Vec<Shown> = uses(d, aid)
+        .into_iter()
+        .filter_map(|id| {
+            let loc = d.find(id)?;
+            Some(Shown { item: d.item_at(&loc)?, page: d.page_of_item(id), parent_xf: d.parent_xf(&loc) })
+        })
+        .collect();
+    for st in d.stories.values() {
+        let mut composed = None;
+        for (k, o) in st.objects.iter().enumerate() {
+            let mut found = false;
+            o.item.walk(&mut |i| found |= matches!(&i.content, Content::Graphic(g) if g.asset == aid));
+            if !found {
+                continue;
+            }
+            let cs = composed.get_or_insert_with(|| cache.get(d, st.id, None));
+            let placed = cs.frames.iter().find_map(|ft| ft.objects.iter().find(|p| p.index == k).map(|p| (ft.frame, p.origin)));
+            // Overset: no page; the resolution of the object as it would show.
+            let (page, xf) = match placed {
+                Some((fid, origin)) => {
+                    let frame_xf =
+                        d.find(fid).map_or(Affine::IDENTITY, |loc| d.parent_xf(&loc)) * d.item(fid).map_or(Affine::IDENTITY, |i| d.text_xf(i));
+                    (d.page_of_item(fid), frame_xf * Affine::translate(origin.to_vec2()))
+                }
+                None => (None, Affine::IDENTITY),
+            };
+            walk(&o.item, xf, aid, page, &mut out);
+        }
+    }
+    out
+}
+
+fn list(d: &Document, cache: &Cache, document: Option<&Path>, checks: &mut TextChecks) -> Vec<Value> {
     let texts = d.stories.values().filter_map(|st| {
         let l = st.file_link.as_ref()?;
         let uses: Vec<Value> = st.frames.iter().map(|id| json!({"id": id.0, "page": d.page_of_item(*id).map(|p| d.page_name(p))})).collect();
-        Some(json!({"story": st.id.0, "name": file_name(&l.path), "path": l.path, "status": text_status(l, checks), "edited": story_hash(st) != l.story_hash, "uses": uses}))
+        Some(json!({"story": st.id.0, "name": file_name(&l.path), "path": l.path, "status": text_status(l, checks, document), "refused": refused(&l.path, document).map(|r| r.to_string()), "edited": story_hash(st) != l.story_hash, "uses": uses}))
     });
     let used = d.used_assets();
     d.assets
         .values()
         .filter(|a| used.contains(&a.id))
         .map(|a| {
-            let uses: Vec<Value> = uses(d, a.id)
+            let uses: Vec<Value> = shown(d, cache, a.id)
                 .into_iter()
-                .map(|id| {
+                .map(|u| {
+                    let it = u.item;
                     // Effective resolution: image pixels over the size it is shown at.
                     let ppi = (|| {
-                        let loc = d.find(id)?;
-                        let it = d.item_at(&loc)?;
                         let Content::Graphic(g) = &it.content else { return None };
                         // Vector (placed PDF or SVG): no effective resolution.
                         if a.mime == "application/pdf" || a.mime == "image/svg+xml" {
                             return None;
                         }
                         let (pw, _) = a.pixels?;
-                        let xf = d.parent_xf(&loc) * it.xf * g.xf;
+                        let xf = u.parent_xf * it.xf * g.xf;
                         let shown_w = xf.transform_rect_bbox(designcraft_geom::Rect::new(0.0, 0.0, g.size.0, g.size.1)).width();
                         (shown_w > 0.0).then(|| (pw as f64 / (shown_w / 72.0)).round())
                     })();
-                    let page = d.page_of_item(id).map(|p| d.page_name(p));
-                    json!({"id": id.0, "page": page, "ppi": ppi})
+                    let page = u.page.map(|p| d.page_name(p));
+                    json!({"id": it.id.0, "page": page, "ppi": ppi})
                 })
                 .collect();
             let pdf_crop = (a.mime == "application/pdf").then(|| a.pdf_crop.name());
-            json!({"asset": a.id.0, "name": a.name, "path": a.link, "status": status(a), "pixels": a.pixels, "pdfCrop": pdf_crop, "uses": uses})
+            let why = a.link.as_deref().and_then(|l| refused(l, document)).map(|r| r.to_string());
+            json!({"asset": a.id.0, "name": a.name, "path": a.link, "status": status(a, document), "refused": why, "pixels": a.pixels, "pdfCrop": pdf_crop, "uses": uses})
         })
         .chain(texts)
         .collect()
@@ -282,15 +358,16 @@ fn list(d: &Document, checks: &mut TextChecks) -> Vec<Value> {
 
 /// A linked text file's bytes, with its size and time from before they were read.
 #[cfg(not(target_arch = "wasm32"))]
-fn read_text(path: &str) -> Result<(Vec<u8>, Fingerprint)> {
-    let err = |e: std::io::Error| EngineError::Other(format!("{path}: {e}"));
+fn read_text(path: impl AsRef<Path>) -> Result<(Vec<u8>, Fingerprint)> {
+    let path = path.as_ref();
+    let err = |e: std::io::Error| EngineError::Other(format!("{}: {e}", path.display()));
     // The roots' own message when they refuse the path.
     crate::file_access::check_read(path).map_err(EngineError::Other)?;
     let m = crate::io::metadata(path).map_err(err)?;
     if !crate::io::is_file(path) {
-        return Err(EngineError::Other(format!("{path}: not a file")));
+        return Err(EngineError::Other(format!("{}: not a file", path.display())));
     }
-    let too_large = || EngineError::Other(format!("{path}: larger than {} MiB", MAX_TEXT_LINK_BYTES / (1024 * 1024)));
+    let too_large = || EngineError::Other(format!("{}: larger than {} MiB", path.display(), MAX_TEXT_LINK_BYTES / (1024 * 1024)));
     if m.len() > MAX_TEXT_LINK_BYTES {
         return Err(too_large());
     }
@@ -303,8 +380,8 @@ fn read_text(path: &str) -> Result<(Vec<u8>, Fingerprint)> {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn read_text(path: &str) -> Result<(Vec<u8>, Fingerprint)> {
-    Err(EngineError::Other(format!("{path}: files can't be read on the web")))
+fn read_text(path: impl AsRef<Path>) -> Result<(Vec<u8>, Fingerprint)> {
+    Err(EngineError::Other(format!("{}: files can't be read on the web", path.as_ref().display())))
 }
 
 /// Import a linked text file again; a warning says when edits made in the layout were replaced.
@@ -318,24 +395,31 @@ fn reimport(d: &mut Document, sid: StoryId, path: &str, bytes: &[u8], before: Fi
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn reload(path: &str) -> Result<(Vec<u8>, (u32, u32))> {
+fn reload(path: impl AsRef<Path>) -> Result<(Vec<u8>, (u32, u32))> {
+    let path = path.as_ref();
     let b = crate::io::read_file(path).map_err(EngineError::Other)?;
-    let px = designcraft_render::image_size(&b).ok_or_else(|| bad("links", format!("{path}: unsupported or corrupt image")))?;
+    if designcraft_render::is_pdf(&b) {
+        designcraft_render::check_pdf_input_size(b.len()).map_err(|e| bad("links", format!("{}: {e}", path.display())))?;
+    }
+    let px = designcraft_render::image_size(&b).ok_or_else(|| bad("links", format!("{}: unsupported or corrupt image", path.display())))?;
     Ok((b, px))
 }
 
 #[cfg(target_arch = "wasm32")]
-fn reload(path: &str) -> Result<(Vec<u8>, (u32, u32))> {
-    Err(EngineError::Other(format!("{path}: files can't be read on the web")))
+fn reload(path: impl AsRef<Path>) -> Result<(Vec<u8>, (u32, u32))> {
+    Err(EngineError::Other(format!("{}: files can't be read on the web", path.as_ref().display())))
 }
 
-fn relinked_asset(a: &designcraft_doc::Asset, path: &str) -> Result<Arc<designcraft_doc::Asset>> {
-    let (bytes, px) = reload(path)?;
+/// The replacement for `a`: bytes read from `read`, with `link` recorded as the stored link.
+/// Relink passes the file the user chose as both. Update passes the path the stored link resolved
+/// to and the stored link itself, so refreshing a link never rewrites what the document holds.
+fn relinked_asset(a: &designcraft_doc::Asset, read: &Path, link: &str) -> Result<Arc<designcraft_doc::Asset>> {
+    let (bytes, px) = reload(read)?;
     let page = if designcraft_render::is_pdf(&bytes) { a.page } else { 0 };
     let px = if page > 0 {
         designcraft_render::pdf_page_size(&bytes, page as usize)
             .map(|(w, h)| (w.round().max(1.0) as u32, h.round().max(1.0) as u32))
-            .ok_or_else(|| bad("links", format!("{path}: can't read PDF page {}", u64::from(page) + 1)))?
+            .ok_or_else(|| bad("links", format!("{}: can't read PDF page {}", read.display(), u64::from(page) + 1)))?
     } else {
         px
     };
@@ -344,8 +428,8 @@ fn relinked_asset(a: &designcraft_doc::Asset, path: &str) -> Result<Arc<designcr
     a.data = Arc::new(bytes);
     a.pixels = Some(px);
     a.page = page;
-    a.name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
-    a.link = Some(path.to_string());
+    a.name = Path::new(link).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| link.to_string());
+    a.link = Some(link.to_string());
     // A placed PDF keeps its crop choice; its box is found on the new file.
     super::file::crop_pdf(&mut a);
     Ok(Arc::new(a))
@@ -364,7 +448,7 @@ fn relink(s: &mut Session, p: &Value) -> Result<Value> {
     let aid = asset_param(p, "links.relink")?;
     let a = s.doc()?.doc.assets.get(&aid).ok_or_else(|| bad("links.relink", "no such graphic"))?;
     // Build the replacement before the edit: a file that cannot be read leaves the document as it was.
-    let fresh = relinked_asset(a, &path)?;
+    let fresh = relinked_asset(a, Path::new(&path), &path)?;
     s.edit(|d, _| {
         let name = fresh.name.clone();
         d.assets.insert(aid, fresh);
@@ -387,11 +471,12 @@ fn relink_folder(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let missing_only = p.get("missingOnly").and_then(Value::as_bool).unwrap_or(dir.is_some() && ext.is_none());
     let only: Option<Vec<u64>> = p.get("assets").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).collect());
-    let d = &s.doc()?.doc;
+    let st = s.doc()?;
+    let (d, document) = (&st.doc, st.path.as_deref().map(Path::new));
     let mut todo: Vec<(AssetId, std::path::PathBuf)> = Vec::new();
     let mut not_found = Vec::new();
     for a in d.assets.values() {
-        if only.as_ref().is_some_and(|o| !o.contains(&a.id.0)) || (missing_only && status(a) != "missing") {
+        if only.as_ref().is_some_and(|o| !o.contains(&a.id.0)) || (missing_only && status(a, document) != "missing") {
             continue;
         }
         let old = std::path::PathBuf::from(a.link.clone().unwrap_or_else(|| a.name.clone()));
@@ -399,9 +484,15 @@ fn relink_folder(s: &mut Session, p: &Value) -> Result<Value> {
         if let Some(e) = &ext {
             name = std::path::Path::new(&name).with_extension(e).into_os_string();
         }
-        let folder = dir.clone().or_else(|| old.parent().map(|p| p.to_path_buf())).unwrap_or_default();
-        let cand = folder.join(&name);
-        if crate::io::exists(&cand) {
+        // The link's own folder only where the link may be followed; the name only as a plain
+        // file name (not a device).
+        let folder = match &dir {
+            Some(dir) => Some(dir.clone()),
+            None => a.link.as_deref().and_then(|l| crate::io::document_path(l, document).ok()).and_then(|p| p.parent().map(Path::to_path_buf)),
+        };
+        let plain_name = name.to_str().is_some_and(|n| !n.contains(['/', '\\']) && craft_docpath::is_local(n));
+        let cand = folder.filter(|_| plain_name).map(|f| f.join(&name));
+        if let Some(cand) = cand.filter(|c| crate::io::exists(c)) {
             todo.push((a.id, cand));
         } else {
             not_found.push(name.to_string_lossy().to_string());
@@ -412,7 +503,7 @@ fn relink_folder(s: &mut Session, p: &Value) -> Result<Value> {
     let mut fresh = Vec::new();
     for (aid, path) in todo {
         let a = d.assets.get(&aid).ok_or_else(|| bad("links.relinkFolder", "no such graphic"))?;
-        fresh.push((aid, relinked_asset(a, &path.to_string_lossy())?));
+        fresh.push((aid, relinked_asset(a, &path, &path.to_string_lossy())?));
     }
     let n = fresh.len();
     if n > 0 {
@@ -427,25 +518,36 @@ fn relink_folder(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn update(s: &mut Session, p: &Value) -> Result<Value> {
-    let d = s.doc()?.doc.clone();
+    let (d, document) = {
+        let st = s.doc()?;
+        (st.doc.clone(), st.path.clone())
+    };
+    let document = document.as_deref().map(Path::new);
     let checks = &mut s.text_link_checks;
     let (only_asset, only_story) = (p.get("asset").and_then(Value::as_u64), story_param(p));
     let all = only_asset.is_none() && only_story.is_none();
-    let texts: Vec<(StoryId, String)> = d
+    // A link craft-docpath refuses is missing, so it is never read or refreshed.
+    let resolved = |link: &str| crate::io::document_path(link, document).ok();
+    let texts: Vec<(StoryId, String, std::path::PathBuf)> = d
         .stories
         .values()
         .filter(|st| all || only_story == Some(st.id))
-        .filter_map(|st| st.file_link.as_ref().filter(|l| text_status(l, checks) == "modified").map(|l| (st.id, l.path.clone())))
+        .filter_map(|st| {
+            let l = st.file_link.as_ref().filter(|l| text_status(l, checks, document) == "modified")?;
+            Some((st.id, l.path.clone(), resolved(&l.path)?))
+        })
         .collect();
     let mut fresh = Vec::new();
-    for a in d.assets.values().filter(|a| all || only_asset == Some(a.id.0)).filter(|a| status(a) == "modified") {
-        if let Some(path) = &a.link {
-            fresh.push((a.id, relinked_asset(a, path)?));
+    for a in d.assets.values().filter(|a| all || only_asset == Some(a.id.0)).filter(|a| status(a, document) == "modified") {
+        // The bytes come from where the stored link resolves; the link itself stays as the
+        // document stored it, so refreshing never rewrites a relative link to an absolute one.
+        if let Some((link, at)) = a.link.as_deref().and_then(|l| resolved(l).map(|at| (l, at))) {
+            fresh.push((a.id, relinked_asset(a, &at, link)?));
         }
     }
     let mut fresh_texts = Vec::new();
-    for (sid, path) in texts {
-        let (bytes, before) = read_text(&path)?;
+    for (sid, path, at) in texts {
+        let (bytes, before) = read_text(&at)?;
         fresh_texts.push((sid, path, bytes, before));
     }
     let n = fresh.len() + fresh_texts.len();
@@ -480,6 +582,31 @@ mod tests {
         }
         let result = s.execute("file.exportPdf", &json!({})).unwrap();
         super::super::file::base64_decode(result["base64"].as_str().unwrap())
+    }
+
+    #[test]
+    fn anchored_image_lists_its_page_and_resolution() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"pages": 2, "facingPages": false})).unwrap();
+        let r = s
+            .execute("frame.create", &json!({"spread": 1, "rect": [72, 72, 400, 400], "content": "text", "text": "Before after and more words."}))
+            .unwrap();
+        let sid = s.doc().unwrap().doc.item(ItemId(r["id"].as_u64().unwrap())).unwrap().text_frame().unwrap().story;
+        let placed = s
+            .execute(
+                "file.place",
+                &json!({"base64": super::super::file::base64_encode(&png(10, 10)), "name": "dot.png", "x": 450, "y": 450, "width": 36}),
+            )
+            .unwrap();
+        let id = placed["id"].as_u64().unwrap();
+        let before = s.execute("links.list", &json!({})).unwrap();
+        assert_eq!(before[0]["uses"][0]["ppi"], 20.0);
+        s.execute("anchored.insert", &json!({"ids": [id], "story": sid.0, "pos": 7})).unwrap();
+        let list = s.execute("links.list", &json!({})).unwrap();
+        let uses = list[0]["uses"].as_array().unwrap();
+        assert_eq!(uses.len(), 1, "anchored image must have one use: {list}");
+        assert_eq!(uses[0]["page"], "2");
+        assert_eq!(uses[0]["ppi"], 20.0);
     }
 
     #[test]
@@ -571,7 +698,8 @@ mod tests {
         assert_eq!(s.execute("links.list", &json!({})).unwrap()[0]["status"], "embedded");
         std::fs::remove_file(&replacement).unwrap();
         let embedded = designcraft_format::load(&designcraft_format::save(&s.doc().unwrap().doc).unwrap()).unwrap();
-        assert_eq!(status(&embedded.assets[&aid]), "embedded");
+        // The asset is embedded, so no link is followed and the document is irrelevant.
+        assert_eq!(status(&embedded.assets[&aid], None), "embedded");
         assert_eq!(embedded.assets[&aid].data.as_slice(), changed);
         assert!(designcraft_render::decode_pixmap(&embedded.assets[&aid].data).is_some());
         let _ = std::fs::remove_dir_all(dir);
@@ -1205,7 +1333,7 @@ mod text_link_tests {
         // Saved and opened again: the link and its options are kept.
         let back = designcraft_format::load(&designcraft_format::save(&s.doc().unwrap().doc).unwrap()).unwrap();
         assert_eq!(back.story(sid).unwrap().file_link, story(&s, sid).file_link);
-        assert_eq!(super::text_status(back.story(sid).unwrap().file_link.as_ref().unwrap(), &mut Default::default()), "ok");
+        assert_eq!(super::text_status(back.story(sid).unwrap().file_link.as_ref().unwrap(), &mut Default::default(), None), "ok");
 
         // The file moves: Missing; Relink to it imports it into the story.
         let moved = dir.join("moved").join("chapter.docx");
@@ -1344,7 +1472,7 @@ mod text_link_read_tests {
 
     fn status_of(path: &std::path::Path, size: u64) -> &'static str {
         let l = TextFileLink { path: path.to_string_lossy().to_string(), size, hash: "0".into(), ..Default::default() };
-        promptly(move || text_status(&l, &mut Default::default()))
+        promptly(move || text_status(&l, &mut Default::default(), None))
     }
 
     fn read(path: &std::path::Path) -> Result<usize, String> {
