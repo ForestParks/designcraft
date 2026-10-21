@@ -923,6 +923,12 @@ impl<'a> Ex<'a> {
             if let Some(vj) = cs.vj {
                 el.set("VerticalJustification", names::vj_out(vj));
             }
+            if let Some(fb) = cs.first_baseline {
+                el.set("FirstBaselineOffset", names::first_baseline_out(fb));
+            }
+            if let Some(min) = cs.first_baseline_min {
+                el.set("MinimumFirstBaselineOffset", num(min));
+            }
             if let Some(st) = &cs.stroke {
                 for side in ["TopEdge", "LeftEdge", "BottomEdge", "RightEdge"] {
                     self.cell_stroke_attrs(&mut el, side, st);
@@ -2083,9 +2089,17 @@ impl<'a> Ex<'a> {
 
     fn image_el(&mut self, asset: &designcraft_doc::Asset, g: &designcraft_doc::Graphic) -> El {
         let is_pdf = asset.mime == "application/pdf";
-        let mut el = El::new(if is_pdf { "PDF" } else { "Image" }).attr("Self", self.fresh());
+        let is_eps = asset.mime == "application/postscript" || designcraft_images::is_eps(&asset.data);
+        let mut el = El::new(if is_eps {
+            "EPS"
+        } else if is_pdf {
+            "PDF"
+        } else {
+            "Image"
+        })
+        .attr("Self", self.fresh());
         // A PDF is vector: its page size in `pixels` isn't a resolution, and a cropped graphic
-        // spans less than the page.
+        // spans less than the page. An EPS's `pixels` is its preview raster, so it still counts.
         if let Some((pw, ph)) = asset.pixels.filter(|_| !is_pdf)
             && g.size.0 > 0.0
             && g.size.1 > 0.0
@@ -2125,7 +2139,7 @@ impl<'a> Ex<'a> {
                 .attr("AssetURL", "$ID/")
                 .attr("AssetID", "$ID/")
                 .attr("LinkResourceURI", uri)
-                .attr("LinkResourceFormat", format!("$ID/{}", format_name(&asset.mime)))
+                .attr("LinkResourceFormat", format!("$ID/{}", format_name(if is_eps { "application/postscript" } else { &asset.mime })))
                 .attr("StoredState", if embed { "Embedded" } else { "Normal" })
                 .attr("LinkClassID", "35906")
                 .attr("LinkClientID", "257")
@@ -2762,6 +2776,8 @@ impl<'a> Ex<'a> {
                     .attr("BottomInset", num(cell.insets[2]))
                     .attr("RightInset", num(cell.insets[3]))
                     .attr("VerticalJustification", vj)
+                    .attr("FirstBaselineOffset", names::first_baseline_out(cell.first_baseline))
+                    .attr("MinimumFirstBaselineOffset", num(cell.first_baseline_min))
                     .attr("RotationAngle", num(cell.rotation));
                 for (i, side) in ["TopEdge", "LeftEdge", "BottomEdge", "RightEdge"].iter().enumerate() {
                     // Do not turn absent native defaults into explicit shared-edge candidates.
@@ -3027,6 +3043,7 @@ fn format_name(mime: &str) -> &'static str {
         "image/gif" => "GIF",
         "image/tiff" => "TIFF",
         "application/pdf" => "Adobe Portable Document Format (PDF)",
+        "application/postscript" => "Encapsulated PostScript (EPS)",
         _ => "Portable Network Graphics (PNG)",
     }
 }

@@ -21,14 +21,16 @@ use designcraft_doc::{AssetId, Document, ParaAttrs, Story};
 use serde_json::{Value, json};
 
 pub const MIME: &str = "application/vnd.designcraft+zip";
-pub const VERSION: u32 = 2;
+/// Latest reader capability. Version 2 pinned the Keep Lines Together and drop cap defaults;
+/// version 3 adds rendering of retained EPS source assets.
+pub const VERSION: u32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FormatError {
     #[error("not a DesignCraft document: {0}")]
     NotOurs(String),
     #[error("document is from a newer DesignCraft (format {0}); please update")]
-    TooNew(u32),
+    TooNew(u64),
     #[error("{0}")]
     Io(String),
     /// The document holds something the file can't represent; nothing is written.
@@ -44,6 +46,7 @@ fn ext_for(mime: &str) -> &'static str {
         "image/webp" => "webp",
         "image/tiff" => "tif",
         "application/pdf" => "pdf",
+        "application/postscript" => "eps",
         "image/svg+xml" => "svg",
         _ => "bin",
     }
@@ -81,7 +84,11 @@ fn save_with_large_entries_from(doc: &Document, preview: Option<&[u8]>, large_en
         z.start_file("mimetype", stored).map_err(io)?;
         z.write_all(MIME.as_bytes()).map_err(|e| FormatError::Io(e.to_string()))?;
         z.start_file("meta.json", deflate).map_err(io)?;
-        let meta = json!({"format": "designcraft", "version": VERSION, "generator": concat!("DesignCraft ", env!("CARGO_PKG_VERSION"))});
+        // Older readers would silently omit EPS artwork. Preview-only legacy assets and
+        // documents without EPS stay at 2 so their existing readers keep working; writing 1
+        // would make a reader re-run the version 2 paragraph upgrade over current defaults.
+        let version = if doc.assets.values().any(|a| designcraft_images::is_eps(&a.data)) { VERSION } else { 2 };
+        let meta = json!({"format": "designcraft", "version": version, "generator": concat!("DesignCraft ", env!("CARGO_PKG_VERSION"))});
         z.write_all(meta.to_string().as_bytes()).map_err(|e| FormatError::Io(e.to_string()))?;
         if let Some(png) = preview {
             z.start_file(PREVIEW, stored).map_err(io)?;
@@ -193,8 +200,8 @@ fn load_zip(bytes: &[u8]) -> Result<Document, FormatError> {
     let version = read_entry(&mut z, "meta.json", MAX_JSON_BYTES, &mut left)?
         .and_then(|meta| serde_json::from_slice::<Value>(&meta).ok())
         .and_then(|m| m.get("version").and_then(Value::as_u64))
-        .map_or(1, |v| u32::try_from(v).unwrap_or(u32::MAX));
-    if version > VERSION {
+        .unwrap_or(1);
+    if version > u64::from(VERSION) {
         return Err(FormatError::TooNew(version));
     }
     let json = read_entry(&mut z, "document.json", MAX_JSON_BYTES, &mut left)?.ok_or_else(|| FormatError::NotOurs("missing document.json".into()))?;
@@ -226,7 +233,7 @@ fn load_zip(bytes: &[u8]) -> Result<Document, FormatError> {
             Arc::make_mut(a).data = data;
         }
     }
-    upgrade(&mut doc, version);
+    upgrade(&mut doc, u32::try_from(version).unwrap_or(u32::MAX));
     doc.merge_duplicate_assets();
     doc.mark_differing_margins_local();
     doc.check().map_err(|e| FormatError::NotOurs(e.to_string()))?;
@@ -431,6 +438,39 @@ mod tests {
         }
         z.finish().unwrap();
         buf.into_inner()
+    }
+
+    #[test]
+    fn eps_source_requires_new_reader_but_preview_documents_keep_the_older_one() {
+        let mut d = Document::new(&NewDocument::default());
+        let version = |d: &Document| {
+            let bytes = save(d).unwrap();
+            let mut z = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+            let mut meta = String::new();
+            z.by_name("meta.json").unwrap().read_to_string(&mut meta).unwrap();
+            serde_json::from_str::<Value>(&meta).unwrap()["version"].as_u64().unwrap()
+        };
+        assert_eq!(version(&d), 2);
+        let aid = AssetId(d.alloc());
+        let source = b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 20 10\n%%EOF\n".to_vec();
+        d.assets.insert(
+            aid,
+            Arc::new(Asset {
+                id: aid,
+                name: "logo.eps".into(),
+                mime: "image/png".into(),
+                link: None,
+                data: Arc::new(source.clone()),
+                pixels: Some((40, 20)),
+                page: 0,
+                ..Default::default()
+            }),
+        );
+        place(&mut d, aid, 0.0);
+        assert_eq!(version(&d), 3, "sniff source even when legacy metadata says PNG");
+        assert_eq!(load(&save(&d).unwrap()).unwrap().assets[&aid].data.as_slice(), source);
+        Arc::make_mut(d.assets.get_mut(&aid).unwrap()).data = Arc::new(b"\x89PNG\r\n\x1a\npreview".to_vec());
+        assert_eq!(version(&d), 2, "legacy EPS previews stay compatible");
     }
 
     #[test]
@@ -773,14 +813,16 @@ mod tests {
     #[test]
     fn rejects_garbage_and_newer_versions() {
         assert!(load(b"nope").is_err());
-        let mut buf = Cursor::new(Vec::new());
-        {
-            let mut z = zip::ZipWriter::new(&mut buf);
-            z.start_file("meta.json", zip::write::SimpleFileOptions::default()).unwrap();
-            z.write_all(br#"{"version": 99}"#).unwrap();
-            z.finish().unwrap();
+        for version in [99u64, u64::from(u32::MAX) + 2] {
+            let mut buf = Cursor::new(Vec::new());
+            {
+                let mut z = zip::ZipWriter::new(&mut buf);
+                z.start_file("meta.json", zip::write::SimpleFileOptions::default()).unwrap();
+                z.write_all(json!({"version": version}).to_string().as_bytes()).unwrap();
+                z.finish().unwrap();
+            }
+            assert!(matches!(load(&buf.into_inner()), Err(FormatError::TooNew(v)) if v == version));
         }
-        assert!(matches!(load(&buf.into_inner()), Err(FormatError::TooNew(99))));
     }
 
     fn r7a_nullable_document(local_clear: bool, style_clear: bool) -> Document {
