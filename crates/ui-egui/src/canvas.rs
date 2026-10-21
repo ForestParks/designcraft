@@ -549,7 +549,8 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
     if draw_drag {
         if preview {
             for slot in &layout.slots {
-                app.canvas.drag.paint(&painter.with_clip_rect(xf.rect(slot.bounds).intersect(screen)), &xf);
+                let clip = shown_area(app, &doc, &xf, slot).intersect(screen);
+                app.canvas.drag.paint(&painter.with_clip_rect(clip), &xf);
             }
         } else {
             app.canvas.drag.paint(&painter, &xf);
@@ -910,7 +911,6 @@ fn render_texture(app: &mut DesignApp, ctx: &egui::Context, rect: Rect, xf: &Xf,
     // Preserve full-quality partial redraws for small changes, including live interactions.
     // Only a large or unbounded change needs the draft whole-canvas fallback.
     if !app.canvas.defer_full
-        && (!app.canvas.drag_active || (!app.ui.proof_colors && app.ui.ink_limit.is_none()))
         && !app.canvas.low_quality
         && doc_changed
         && zoom_same
@@ -1018,7 +1018,8 @@ fn patch_texture(app: &mut DesignApp, layout: &CanvasLayout, ppp: f64, doc_key: 
         * Affine::scale(sh.zoom)
         * Affine::translate((-sh.origin.x, -sh.origin.y));
     let opts = screen_options(app, layout, preview, ppp);
-    let img = app.canvas.patcher.render(&new, &app.session.cache, &placed, (x1 - x0) as u32, (y1 - y0) as u32, view, &opts);
+    let mut img = app.canvas.patcher.render(&new, &app.session.cache, &placed, (x1 - x0) as u32, (y1 - y0) as u32, view, &opts);
+    process_canvas_colors(app, &mut img);
     let Some(tex) = app.canvas.texture.as_mut() else { return false };
     let size = tex.size();
     if (x0 as usize).checked_add(img.width as usize).is_none_or(|end| end > size[0])
@@ -1043,18 +1044,23 @@ fn render_worker_spawn(ctx: &egui::Context) -> Option<crate::render_worker::Work
 }
 
 fn upload(app: &mut DesignApp, ctx: &egui::Context, mut img: designcraft_render::Rendered) {
-    if app.ui.proof_colors {
-        designcraft_render::proof_view(&mut img, &app.ui.proof_setup);
-    }
-    // Plates render from source colours; the ink limit is estimated from the composite.
-    if app.ui.separation.is_none() && app.ui.ink_limit.is_some() {
-        designcraft_render::separation_view(&mut img, None, app.ui.ink_limit);
-    }
+    process_canvas_colors(app, &mut img);
     let ci = egui::ColorImage::from_rgba_premultiplied([img.width as usize, img.height as usize], &img.pixels);
     let ci = crate::widgets::fit_texture(ci, ctx.input(|i| i.max_texture_side));
     match &mut app.canvas.texture {
         Some(tex) => tex.set(ci, egui::TextureOptions::LINEAR),
         None => app.canvas.texture = Some(ctx.load_texture("canvas", ci, egui::TextureOptions::LINEAR)),
+    }
+}
+
+/// Full uploads and damage patches must show the same proof and estimated ink limit.
+fn process_canvas_colors(app: &DesignApp, img: &mut designcraft_render::Rendered) {
+    if app.ui.proof_colors {
+        designcraft_render::proof_view(img, &app.ui.proof_setup);
+    }
+    // Plates render from source colours; the ink limit is estimated from the composite.
+    if app.ui.separation.is_none() && app.ui.ink_limit.is_some() {
+        designcraft_render::separation_view(img, None, app.ui.ink_limit);
     }
 }
 

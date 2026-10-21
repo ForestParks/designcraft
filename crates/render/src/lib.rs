@@ -381,7 +381,7 @@ impl Renderer {
         self.cmyk_ran = false;
         let image = self.render_uncached(doc, cache, spreads, width, height, view, opts);
         // Kept only when the ink passes ran: other views render at their usual cost anyway.
-        if self.cmyk_ran && image.pixels.len() <= blendspace::CachedView::MAX_BYTES {
+        if self.cmyk_ran && !image.pixels.is_empty() && !opts.cancelled() && image.pixels.len() <= blendspace::CachedView::MAX_BYTES {
             self.cmyk_view = Some(blendspace::CachedView::new(doc, spreads, view, opts, &image, self.stats, self.threads));
         }
         self.stats.micros = now().saturating_sub(start);
@@ -438,6 +438,7 @@ impl Renderer {
             self.draw_spread(&mut ctx, &f, pl.spread);
         }
         if opts.cancelled() {
+            self.cmyk_ran = false;
             self.ctx = Some(ctx);
             return Rendered { width: 0, height: 0, pixels: Vec::new() };
         }
@@ -448,6 +449,7 @@ impl Renderer {
             ctx.render(pm, &mut self.resources);
         }
         if opts.cancelled() {
+            self.cmyk_ran = false;
             self.ctx = Some(ctx);
             return Rendered { width: 0, height: 0, pixels: Vec::new() };
         }
@@ -1725,8 +1727,24 @@ mod tests {
         let cancelled = r.render(&doc, &cache, &placed, 64, 64, Affine::IDENTITY, &opts);
         assert!(cancelled.pixels.is_empty());
         assert_eq!(cancelled.width, 0);
+        assert!(r.cmyk_view.is_none(), "a cancelled result must not enter the view cache");
         let good = r.render(&doc, &cache, &placed, 64, 64, Affine::IDENTITY, &RenderOptions::default());
         assert_eq!(good.pixel(20, 20), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn cancelled_render_clears_a_completed_cmyk_pass_before_returning() {
+        let doc = Document::new(&NewDocument::default());
+        let cache = Cache::new();
+        let mut renderer = Renderer::new();
+        renderer.threads = 0;
+        // Model cancellation after a spread's ink pass has marked the frame cacheable.
+        renderer.cmyk_ran = true;
+        let opts = RenderOptions { cancellation: Some(Cancellation { generation: Arc::new(AtomicU64::new(2)), expected: 1 }), ..Default::default() };
+        let image = renderer.render_uncached(&doc, &cache, &[], 64, 64, Affine::IDENTITY, &opts);
+        assert!(image.pixels.is_empty());
+        assert!(!renderer.cmyk_ran, "an aborted frame must clear its completed ink-pass state");
+        assert!(renderer.cmyk_view.is_none());
     }
     #[test]
     fn eps_source_decodes_like_its_preview() {
