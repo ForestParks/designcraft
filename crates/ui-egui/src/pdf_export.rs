@@ -225,7 +225,7 @@ mod tests {
         let mut out = ctx.run_ui(raw, |ui| app.handle_quit(ui.ctx()));
         out.textures_delta.clear();
         assert!(out.viewport_output[&egui::ViewportId::ROOT].commands.contains(&egui::ViewportCommand::CancelClose));
-        assert!(app.run("app.quit", json!({})).is_err(), "export must not silently disappear on normal Quit");
+        assert_eq!(app.run("app.quit", json!({})).unwrap()["queued"], true, "normal Quit waits for the export");
         let report = designcraft_engine::cmd::export_pdf_document(&app.session.active().unwrap().doc, &app.session.cache, &json!({})).unwrap();
         app.services.write = Some(Box::new(|_, _| Err("disk full".into())));
         tx.send(Ok(Done { report, written: None, roots: None })).unwrap();
@@ -233,6 +233,120 @@ mod tests {
         assert!(!app.pdf_export.busy());
         assert!(app.ui.status.contains("disk full"));
         assert!(app.pdf_export.last.as_ref().unwrap()["error"].as_str().unwrap().contains("disk full"));
+    }
+
+    fn logic_frame(app: &mut crate::DesignApp, ctx: &egui::Context, close: bool) -> Vec<egui::ViewportCommand> {
+        let mut raw = egui::RawInput::default();
+        if close {
+            raw.viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close);
+        }
+        let mut out = ctx.run_ui(raw, |ui| app.logic(ui.ctx()));
+        out.textures_delta.clear();
+        out.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.commands.clone()).unwrap_or_default()
+    }
+
+    fn ready_app(ctx: &egui::Context) -> Result<crate::DesignApp, String> {
+        let services = crate::Services { inbox: Some(crate::Inbox::default()), ..Default::default() };
+        let mut app = crate::DesignApp::new(designcraft_engine::Session::new(), services);
+        app.run("file.new", json!({"width":100,"height":100,"pages":1,"facingPages":false}))?;
+        logic_frame(&mut app, ctx, false);
+        logic_frame(&mut app, ctx, false);
+        assert!(app.fonts_ready);
+        Ok(app)
+    }
+
+    #[test]
+    fn pdf_export_defers_inbox_and_os_opens_until_the_terminal_result() {
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queued.designcraft");
+        app.run("file.save", json!({"path":path})).unwrap();
+        let request = app.import_request("open");
+        let inbox = app.services.inbox.as_ref().unwrap().clone();
+        inbox.lock().unwrap().push(crate::ImportedFile { request, name: "inbox.designcraft".into(), bytes: std::fs::read(&path).unwrap() });
+        app.open_documents_later([path.to_string_lossy().into_owned()]);
+        let (tx, rx) = mpsc::sync_channel(1);
+        app.pdf_export.pending = Some(rx);
+        for _ in 0..3 {
+            logic_frame(&mut app, &ctx, false);
+            assert_eq!(app.session.documents().len(), 1);
+            assert_eq!(inbox.lock().unwrap().len(), 1);
+            assert_eq!(app.os_documents.len(), 1);
+        }
+        // A failed export is terminal too; queued inputs must still be delivered once.
+        tx.send(Err("synthetic export failure".into())).unwrap();
+        logic_frame(&mut app, &ctx, false);
+        assert_eq!(app.session.documents().len(), 3);
+        assert!(inbox.lock().unwrap().is_empty());
+        assert!(app.os_documents.is_empty());
+        logic_frame(&mut app, &ctx, false);
+        assert_eq!(app.session.documents().len(), 3);
+    }
+
+    #[test]
+    fn pdf_export_replays_dropped_graphics_at_the_original_pointer() {
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx).unwrap();
+        app.canvas_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0)));
+        *app.view_mut().unwrap() = crate::View { zoom: 1.0, origin: designcraft_geom::Point::ZERO, fitted: true, rotation: 0 };
+        let pointer = Some(egui::pos2(25.0, 35.0));
+        let (_, expected) = crate::canvas::drop_point(&app, pointer).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("placed.svg");
+        std::fs::write(
+            &path,
+            br##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10" fill="#ff0000"/></svg>"##,
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::sync_channel(1);
+        app.pdf_export.pending = Some(rx);
+        app.deferred_drops.push((path.to_string_lossy().into_owned(), pointer));
+        logic_frame(&mut app, &ctx, false);
+        assert_eq!(app.deferred_drops.len(), 1);
+        assert!(app.session.doc().unwrap().doc.spreads[0].items.is_empty());
+        tx.send(Err("synthetic export failure".into())).unwrap();
+        logic_frame(&mut app, &ctx, false);
+        assert!(app.deferred_drops.is_empty());
+        assert_eq!(app.session.documents().len(), 1, "a graphic must be placed, not opened as a document");
+        let items = &app.session.doc().unwrap().doc.spreads[0].items;
+        assert_eq!(items.len(), 1);
+        let bounds = items[0].bounds();
+        assert!((bounds.x0 - expected.x).abs() < 0.01 && (bounds.y0 - expected.y).abs() < 0.01, "{bounds:?} vs {expected:?}");
+        logic_frame(&mut app, &ctx, false);
+        assert_eq!(app.session.doc().unwrap().doc.spreads[0].items.len(), 1);
+    }
+
+    #[test]
+    fn pdf_export_replays_menu_and_window_quit_after_success_or_failure() {
+        for menu in [false, true] {
+            for success in [false, true] {
+                let ctx = egui::Context::default();
+                let mut app = ready_app(&ctx).unwrap();
+                app.run("frame.create", json!({"rect":[10,10,20,20]})).unwrap();
+                let report =
+                    designcraft_engine::cmd::export_pdf_document(&app.session.active().unwrap().doc, &app.session.cache, &json!({})).unwrap();
+                let (tx, rx) = mpsc::sync_channel(1);
+                app.pdf_export.pending = Some(rx);
+                if menu {
+                    assert_eq!(app.run("app.quit", json!({})).unwrap()["queued"], true);
+                    logic_frame(&mut app, &ctx, false);
+                } else {
+                    assert!(logic_frame(&mut app, &ctx, true).contains(&egui::ViewportCommand::CancelClose));
+                }
+                assert!(app.quit_after_export);
+                assert!(app.ui.dialog.is_none());
+                tx.send(if success { Ok(Done { report, written: Some(1), roots: None }) } else { Err("synthetic failure".into()) }).unwrap();
+                assert!(logic_frame(&mut app, &ctx, false).contains(&egui::ViewportCommand::Close));
+                assert!(!app.quit_after_export);
+                assert!(logic_frame(&mut app, &ctx, true).contains(&egui::ViewportCommand::CancelClose));
+                assert_eq!(app.ui.dialog.as_ref().unwrap().id, "closeDocument", "unsaved changes still ask after export");
+                app.ui.dialog = None; // Cancel the resumed Quit.
+                assert!(!logic_frame(&mut app, &ctx, false).contains(&egui::ViewportCommand::Close));
+                assert_eq!(app.session.documents().len(), 1);
+                assert!(app.session.active().unwrap().is_dirty());
+            }
+        }
     }
 
     #[test]

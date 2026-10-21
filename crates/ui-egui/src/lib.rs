@@ -600,6 +600,9 @@ pub struct DesignApp {
     /// Files the operating system asked to open (macOS Finder, Dock, Open With), opened once the
     /// window is ready; see [`DesignApp::open_documents_later`].
     os_documents: Vec<String>,
+    /// Native drops waiting for fonts or a PDF export, retaining their placement position.
+    #[cfg(not(target_arch = "wasm32"))]
+    deferred_drops: Vec<(String, Option<egui::Pos2>)>,
     pub integrated_titlebar: bool,
     /// The desktop host uses our caption controls and window drag/resize regions (Windows).
     pub custom_titlebar: bool,
@@ -631,6 +634,8 @@ pub struct DesignApp {
     pub(crate) canvas_ime: bool,
     /// Quit was chosen: close the window on the next frame, as its close button does.
     quit_requested: bool,
+    /// Replay normal Quit after the active PDF export reaches a terminal result.
+    quit_after_export: bool,
     /// Close the window without asking about unsaved changes (the control channel's `app.quit`).
     pub(crate) quit_without_asking: bool,
     /// No document is discarded until every unsaved document has an up-to-date approval.
@@ -690,6 +695,8 @@ impl DesignApp {
             restyle: false,
             fonts_ready: false,
             os_documents: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            deferred_drops: Vec::new(),
             integrated_titlebar: false,
             custom_titlebar: false,
             window_maximized: false,
@@ -705,6 +712,7 @@ impl DesignApp {
             ime_discard: false,
             canvas_ime: false,
             quit_requested: false,
+            quit_after_export: false,
             quit_without_asking: false,
             quitting: None,
             cursors: cursors::Images::default(),
@@ -778,6 +786,10 @@ impl DesignApp {
     /// THE entry point for every action (menus, shortcuts, palette, panels, control channel).
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
         if self.pdf_export.busy() {
+            if id == "app.quit" {
+                self.quit_after_export = true;
+                return Ok(json!({"queued": true}));
+            }
             return Err("Please wait for the PDF export to finish".into());
         }
         if let Some(r) = menus::run_ui(self, id, &params) {
@@ -1136,6 +1148,9 @@ impl DesignApp {
                 Ok(v) => format!("PDF exported: {} ({} pages)", v["path"].as_str().unwrap_or(""), v["pages"]),
                 Err(e) => format!("PDF export failed: {e}"),
             });
+            if std::mem::take(&mut self.quit_after_export) {
+                self.request_quit();
+            }
         }
         if self.egui_ctx.is_none() {
             self.egui_ctx = Some(ctx.clone());
@@ -1195,7 +1210,7 @@ impl DesignApp {
         self.last_time = now;
         self.drain_control(ctx);
         new_document::end_stale_preview(self);
-        if self.fonts_ready {
+        if self.fonts_ready && !self.pdf_export.busy() {
             self.drain_inbox();
             self.open_os_documents();
         }
@@ -1214,7 +1229,12 @@ impl DesignApp {
             for f in dropped {
                 let p = f.path().to_string_lossy().to_string();
                 if !p.is_empty() {
-                    let _ = self.open_dropped_at(&p, pointer);
+                    self.deferred_drops.push((p, pointer));
+                }
+            }
+            if self.fonts_ready && !self.pdf_export.busy() {
+                for (path, pointer) in std::mem::take(&mut self.deferred_drops) {
+                    let _ = self.open_dropped_at(&path, pointer);
                 }
             }
         }
@@ -1234,6 +1254,7 @@ impl DesignApp {
         }
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.pdf_export.busy() && !self.quit_without_asking {
+                self.quit_after_export = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 return;
             }

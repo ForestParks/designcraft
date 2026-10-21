@@ -346,6 +346,8 @@ list) · [roadmap.md](docs/roadmap.md) (milestones, plan) · [parity-checklist.m
 
 ## Progress log
 
+- **2026-10-21** · Desktop PDF export retains asynchronous file deliveries, operating-system opens and dropped-file placement positions until completion, and replays normal Quit requests afterward with unsaved-document prompts intact. No readiness percentage change.
+
 - 2026-10-15: Run desktop PDF generation and atomic writing on a worker, show elapsed progress, retain automation roots and return raw bytes without a base64 round trip. See docs/background-pdf-export.md.
 
 Newest first.

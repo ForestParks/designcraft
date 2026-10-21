@@ -7,6 +7,11 @@ finishes, so colour settings and document state cannot change halfway through th
 desktop host also writes the completed bytes atomically on that worker (custom hosts without a thread-safe writer save on completion); errors and export warnings are shown explicitly.
 Only one PDF export runs at a time. Recovery writes wait until it completes, as they did while the synchronous export blocked the interface. Browser export remains synchronous.
 
+Files delivered by an open dialog or the operating system wait in their queues while exporting.
+Dropped graphics retain their original pointer position and are placed once the job finishes.
+Normal Quit is remembered and resumes after success or failure, still asking about unsaved
+documents. Forced automation shutdown (`app.quit` on the control channel) can interrupt a job.
+
 The native worker uses the same export pipeline as `file.exportPdf`, returning raw PDF bytes
 instead of creating and decoding a large base64 JSON copy. Original artwork, output options and
 PDF quality are unchanged. `ui.inspect.pdfExport` reports `busy` and the last completed result.
