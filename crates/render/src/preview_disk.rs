@@ -22,6 +22,7 @@ type Fingerprint = (Weak<Vec<u8>>, String);
 struct Disk {
     directory: Option<PathBuf>,
     hashes: HashMap<usize, Fingerprint>,
+    colour: Option<(Weak<designcraft_color::cms::Cms>, String)>,
 }
 static DISK: Mutex<Option<Disk>> = Mutex::new(None);
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -64,15 +65,29 @@ fn renderer_tag() -> &'static str {
     })
 }
 
-fn path(bytes: &Arc<Vec<u8>>, page: u32, level: u8) -> Option<PathBuf> {
+fn colour_hash(settings: &designcraft_color::cms::ColorSettings, cmyk: Option<&[u8]>) -> String {
+    let mut hash = Sha256::new();
+    hash.update(format!("{settings:?}").as_bytes());
+    hash.update([u8::from(cmyk.is_some())]);
+    if let Some(profile) = cmyk {
+        hash.update(profile);
+    }
+    format!("{:x}", hash.finalize())
+}
+
+pub(super) fn path_for(bytes: &Arc<Vec<u8>>, page: u32, level: u8, cms: &Arc<designcraft_color::cms::Cms>) -> Option<PathBuf> {
     if !ENABLED.load(Ordering::Relaxed) {
         return None;
     }
     let id = Arc::as_ptr(bytes) as usize;
-    let (directory, hash) = {
+    let (directory, hash, colour) = {
         let disk = DISK.lock().unwrap_or_else(|e| e.into_inner());
         let disk = disk.as_ref()?;
-        (disk.directory.clone()?, disk.hashes.get(&id).filter(|(w, _)| w.strong_count() > 0).map(|(_, h)| h.clone()))
+        (
+            disk.directory.clone()?,
+            disk.hashes.get(&id).filter(|(w, _)| w.strong_count() > 0).map(|(_, h)| h.clone()),
+            disk.colour.as_ref().filter(|(w, _)| w.strong_count() > 0 && std::ptr::eq(w.as_ptr(), Arc::as_ptr(cms))).map(|(_, h)| h.clone()),
+        )
     };
     let hash = hash.unwrap_or_else(|| {
         let hash = format!("{:x}", Sha256::digest(bytes.as_slice()));
@@ -83,15 +98,24 @@ fn path(bytes: &Arc<Vec<u8>>, page: u32, level: u8) -> Option<PathBuf> {
         }
         hash
     });
-    let colour = format!("{:x}", Sha256::digest(format!("{:?}", designcraft_color::cms::active_settings()).as_bytes()));
+    let colour = colour.unwrap_or_else(|| {
+        // A replacement ICC profile can keep its display name. Hash its effective
+        // CMYK bytes too, once per immutable context, rather than reusing old pixels.
+        let profile = cms.cmyk_icc_profile().map(|p| p.to_bytes());
+        let hash = colour_hash(cms.settings(), profile.as_deref().map(Vec::as_slice));
+        if let Some(disk) = DISK.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            disk.colour = Some((Arc::downgrade(cms), hash.clone()));
+        }
+        hash
+    });
     Some(directory.join(format!("v3-{}-{colour}-{hash}-{page}-{level}.dcpreview", renderer_tag())))
 }
 
-pub(super) fn load(bytes: &Arc<Vec<u8>>, page: u32, level: u8, size: (u32, u32)) -> Option<Pixmap> {
-    if size.0 == 0 || size.1 == 0 || size.0 > MAX_SIDE || size.1 > MAX_SIDE {
+pub(super) fn load_path(path: &Path, size: (u32, u32)) -> Option<Pixmap> {
+    if !ENABLED.load(Ordering::Relaxed) || size.0 == 0 || size.1 == 0 || size.0 > MAX_SIDE || size.1 > MAX_SIDE {
         return None;
     }
-    let file = std::fs::File::open(path(bytes, page, level)?).ok()?;
+    let file = std::fs::File::open(path).ok()?;
     let expected = HEADER as u64 + size.0 as u64 * size.1 as u64 * 4;
     if file.metadata().ok()?.len() != expected {
         return None;
@@ -123,11 +147,10 @@ pub(super) fn load(bytes: &Arc<Vec<u8>>, page: u32, level: u8, size: (u32, u32))
     Some(Pixmap::from_parts(rgba, size.0 as u16, size.1 as u16))
 }
 
-pub(super) fn store(bytes: &Arc<Vec<u8>>, page: u32, level: u8, pm: &Pixmap) {
-    if pm.width() as u32 > MAX_SIDE || pm.height() as u32 > MAX_SIDE {
+pub(super) fn store_path(path: &Path, pm: &Pixmap) {
+    if !ENABLED.load(Ordering::Relaxed) || pm.width() as u32 > MAX_SIDE || pm.height() as u32 > MAX_SIDE {
         return;
     }
-    let Some(path) = path(bytes, page, level) else { return };
     let Some(dir) = path.parent() else { return };
     if std::fs::create_dir_all(dir).is_err() {
         return;
@@ -142,7 +165,7 @@ pub(super) fn store(bytes: &Arc<Vec<u8>>, page: u32, level: u8, pm: &Pixmap) {
         file.write_all(&Sha256::digest(&pixels))?;
         file.write_all(&pixels)?;
         drop(file);
-        std::fs::rename(&temp, &path)
+        std::fs::rename(&temp, path)
     };
     if write().is_err() {
         let _ = std::fs::remove_file(&temp);
@@ -202,6 +225,29 @@ fn prune_with_budget(dir: &Path, budget: u64, now: std::time::SystemTime) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn path(bytes: &Arc<Vec<u8>>, page: u32, level: u8) -> Option<PathBuf> {
+        path_for(bytes, page, level, &designcraft_color::cms::active())
+    }
+
+    #[test]
+    fn preview_colour_keys_include_profile_bytes_not_just_the_name() {
+        let settings = designcraft_color::cms::ColorSettings::default();
+        let first = colour_hash(&settings, Some(b"first profile bytes"));
+        assert_ne!(first, colour_hash(&settings, Some(b"replacement profile bytes")));
+        assert_eq!(first, colour_hash(&settings, Some(b"first profile bytes")));
+        assert_ne!(first, colour_hash(&settings, None));
+    }
+
+    fn load(bytes: &Arc<Vec<u8>>, page: u32, level: u8, size: (u32, u32)) -> Option<Pixmap> {
+        load_path(&path(bytes, page, level)?, size)
+    }
+
+    fn store(bytes: &Arc<Vec<u8>>, page: u32, level: u8, pm: &Pixmap) {
+        if let Some(path) = path(bytes, page, level) {
+            store_path(&path, pm);
+        }
+    }
 
     fn dated_file(dir: &Path, name: &str, size: usize, time: std::time::SystemTime) -> PathBuf {
         let path = dir.join(name);
@@ -306,6 +352,16 @@ mod tests {
         *raw.last_mut().unwrap() ^= 1;
         std::fs::write(&p, raw).unwrap();
         assert!(load(&bytes, 1, 2, (2, 2)).is_none());
+        // A pending write owns its captured key, even if host configuration changes
+        // while pixels are prepared. It must never recompute a newer settings/path key.
+        let pending = path(&bytes, 8, 2).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        set_directory(Some(other.path().into()));
+        let changed = path(&bytes, 8, 2).unwrap();
+        store_path(&pending, &pm);
+        assert!(pending.exists());
+        assert!(!changed.exists());
+        set_directory(Some(dir.path().into()));
         // A fresh document can reuse the right PDF page without rasterizing it first.
         let pdf = two_page_pdf();
         let red = crate::images::mip(&pdf, 0, 100.0, 1.0).unwrap();

@@ -542,17 +542,7 @@ impl Session {
         // passes that its command's description doesn't name fails the test.
         #[cfg(test)]
         check_params(id, params)?;
-        if let Err(e) = (spec.enabled)(self) {
-            // A command that takes `ids` acts on the objects the call names, so the selection
-            // doesn't matter: with a text caret, nothing selected, or a selection the command
-            // can't act on, `{"ids": [5]}` still runs.
-            let named = if cmd::selection_reason(&e) { cmd::named_targets(spec, params) } else { None };
-            let Some(ids) = named else { return Err(EngineError::Disabled(id.into(), e)) };
-            let st = self.doc()?;
-            if let Some(gone) = ids.iter().find(|i| st.doc.item(**i).is_none()) {
-                return Err(EngineError::Disabled(id.into(), format!("no object with id {}", gone.0)));
-            }
-        }
+        self.check_enabled(spec, id, params)?;
         // Preview is temporary. Save, merge, and every other edit restore the template first.
         // Queries stay read-only so the panel can poll fields during a preview. `data.preview`
         // itself is the one command that fills the live document.
@@ -571,6 +561,7 @@ impl Session {
             Ok(r) => r,
             Err(e) => {
                 // What it did before it failed can be undone too.
+                self.keep_guide_selection_valid(before.as_ref(), id);
                 self.record_undo_step(spec, before, nested);
                 return Err(e);
             }
@@ -597,11 +588,38 @@ impl Session {
                 st.doc = Arc::new(d);
             }
         }
-        // Auto-size frames fit the text the command changed, in the same undo step.
+        self.autosize_changed(spec, before.as_ref());
+        self.keep_guide_selection_valid(before.as_ref(), id);
+        self.record_undo_step(spec, before, nested);
+        if spec.journal {
+            self.journal.push((id.to_string(), params.clone()));
+        }
+        self.discard_stale_find_scope();
+        Ok(r)
+    }
+
+    /// Fails with `Disabled` unless the command is enabled or names objects it can act on.
+    fn check_enabled(&self, spec: &CommandSpec, id: &str, params: &Value) -> Result<()> {
+        if let Err(e) = (spec.enabled)(self) {
+            // A command that takes `ids` acts on the objects the call names, so the selection
+            // doesn't matter: with a text caret, nothing selected, or a selection the command
+            // can't act on, `{"ids": [5]}` still runs.
+            let named = if cmd::selection_reason(&e) { cmd::named_targets(spec, params) } else { None };
+            let Some(ids) = named else { return Err(EngineError::Disabled(id.into(), e)) };
+            let st = self.doc()?;
+            if let Some(gone) = ids.iter().find(|i| st.doc.item(**i).is_none()) {
+                return Err(EngineError::Disabled(id.into(), format!("no object with id {}", gone.0)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Auto-size frames fit the text the command changed, in the same undo step.
+    fn autosize_changed(&mut self, spec: &CommandSpec, before: Option<&(u64, Arc<Document>, Selection)>) {
         if spec.undoable
             && let Some(st) = self.active_mut()
         {
-            let prev = before.as_ref().filter(|(uid, _, _)| *uid == st.uid).map(|(_, d, _)| d.as_ref());
+            let prev = before.filter(|(uid, _, _)| *uid == st.uid).map(|(_, d, _)| d.as_ref());
             if prev.is_none_or(|p| !std::ptr::eq(p, st.doc.as_ref())) {
                 let todo = autosize::candidates(&st.doc, prev);
                 if !todo.is_empty() {
@@ -613,12 +631,15 @@ impl Session {
                 }
             }
         }
-        self.record_undo_step(spec, before, nested);
-        if spec.journal {
-            self.journal.push((id.to_string(), params.clone()));
+    }
+
+    /// Drops selected guides the command `id` made stale, against the document as it will be
+    /// recorded: after the passes that run with the command (smart reflow, live captions, autosize).
+    fn keep_guide_selection_valid(&mut self, before: Option<&(u64, Arc<Document>, Selection)>, id: &str) {
+        if let Some(st) = self.active_mut() {
+            let old = before.filter(|(uid, _, _)| *uid == st.uid).map(|(_, d, sel)| (d.as_ref(), sel));
+            cmd::guides::keep_selection_valid(st, old, id);
         }
-        self.discard_stale_find_scope();
-        Ok(r)
     }
 
     /// Record undo if the document changed (and we're not previewing an interaction), with the

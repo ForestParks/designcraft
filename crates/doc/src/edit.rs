@@ -318,15 +318,16 @@ impl Document {
         let pos_to = other.frames.iter().position(|f| *f == to).unwrap_or(0);
         let after = other.frames.split_off(pos_to);
         let before = std::mem::take(&mut other.frames);
-        let (vertical, direction) = (other.vertical, other.direction);
+        let (vertical, direction, optical_margin) = (other.vertical, other.direction, other.optical_margin);
         let offset;
         {
             let st = self.story_mut(fs).ok_or(DocError::NoStory(fs))?;
             offset = if st.text.is_empty() { 0 } else { st.text.len().saturating_add(1) };
-            // The story keeps its own direction, even when it was empty and takes the other's text.
-            let own = (st.vertical, st.direction);
+            // The story keeps its own direction and options, even when it was empty and takes the
+            // other's text.
+            let own = (st.vertical, st.direction, st.optical_margin);
             st.append_story(other);
-            (st.vertical, st.direction) = own;
+            (st.vertical, st.direction, st.optical_margin) = own;
             let at = st.frames.iter().position(|f| *f == from).map_or(st.frames.len(), |p| p + 1);
             for (k, f) in after.iter().enumerate() {
                 st.frames.insert(at + k, *f);
@@ -345,6 +346,7 @@ impl Document {
             ns.frames = before.clone();
             ns.vertical = vertical;
             ns.direction = direction;
+            ns.optical_margin = optical_margin;
             for f in &before {
                 if let Some(t) = self.item_mut(*f).and_then(Item::text_frame_mut) {
                     t.story = nid;
@@ -526,12 +528,12 @@ impl Document {
     /// stays with the first part and may become overset).
     pub fn unthread_after(&mut self, frame: ItemId) -> Result<()> {
         let sid = self.item(frame).and_then(|i| i.text_frame()).map(|t| t.story).ok_or(DocError::NoItem(frame))?;
-        let (tail, vertical, direction) = {
+        let (tail, vertical, direction, optical_margin) = {
             let st = self.story_mut(sid).ok_or(DocError::NoStory(sid))?;
             let p = st.frames.iter().position(|f| *f == frame).ok_or(DocError::NoItem(frame))?;
             let tail = st.frames.split_off(p + 1);
             st.rev = st.rev.wrapping_add(1);
-            (tail, st.vertical, st.direction)
+            (tail, st.vertical, st.direction, st.optical_margin)
         };
         if tail.is_empty() {
             return Ok(());
@@ -541,6 +543,7 @@ impl Document {
         ns.frames = tail.clone();
         ns.vertical = vertical;
         ns.direction = direction;
+        ns.optical_margin = optical_margin;
         self.stories.insert(nid, Arc::new(ns));
         for f in tail {
             if let Some(t) = self.item_mut(f).and_then(Item::text_frame_mut) {
@@ -554,20 +557,21 @@ impl Document {
     /// `frame` stays on the page with a new empty story.
     pub fn remove_from_thread(&mut self, frame: ItemId) -> Result<()> {
         let sid = self.item(frame).and_then(|i| i.text_frame()).map(|t| t.story).ok_or(DocError::NoItem(frame))?;
-        let (vertical, direction) = {
+        let (vertical, direction, optical_margin) = {
             let st = self.story_mut(sid).ok_or(DocError::NoStory(sid))?;
             if st.frames.len() < 2 {
                 return Err(DocError::Invalid(format!("frame {frame} is not threaded to another frame")));
             }
             st.frames.retain(|f| *f != frame);
             st.rev = st.rev.wrapping_add(1);
-            (st.vertical, st.direction)
+            (st.vertical, st.direction, st.optical_margin)
         };
         let nid = StoryId(self.alloc());
         let mut ns = Story::new(nid);
         ns.frames = vec![frame];
         ns.vertical = vertical;
         ns.direction = direction;
+        ns.optical_margin = optical_margin;
         self.stories.insert(nid, Arc::new(ns));
         let t = self.item_mut(frame).and_then(Item::text_frame_mut).ok_or(DocError::NoItem(frame))?;
         t.story = nid;

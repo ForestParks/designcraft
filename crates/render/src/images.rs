@@ -13,6 +13,20 @@ const FULL_BUDGET: usize = 192 << 20;
 const PREVIEW_BUDGET: usize = 96 << 20;
 type Key = (usize, u32, u8);
 
+struct Colour {
+    generation: u64,
+    cms: Arc<designcraft_color::cms::Cms>,
+}
+impl Colour {
+    fn current() -> Self {
+        Self { generation: designcraft_color::cms::generation(), cms: designcraft_color::cms::active() }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn is_current(&self) -> bool {
+        self.generation == designcraft_color::cms::generation() && Arc::ptr_eq(&self.cms, &designcraft_color::cms::active())
+    }
+}
+
 /// Failed assets remembered; the oldest is forgotten (and retried if drawn again) beyond this.
 const MAX_BAD: usize = 64;
 
@@ -51,6 +65,7 @@ struct Cache {
     stats: Stats,
     /// The colour settings the pixels were converted with ([`designcraft_color::cms::generation`]).
     colour: u64,
+    cms: Option<Arc<designcraft_color::cms::Cms>>,
 }
 
 impl Cache {
@@ -74,12 +89,13 @@ fn size_of(pm: &Pixmap) -> usize {
 }
 
 fn with<R>(f: impl FnOnce(&mut Cache) -> R) -> R {
-    let mut g = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let c = g.get_or_insert_with(Cache::default);
     // Decoding converts CMYK through the working space: new colour settings, new pixels.
     let colour = designcraft_color::cms::generation();
-    if c.colour != colour {
-        *c = Cache { clock: c.clock, colour, ..Cache::default() };
+    let cms = designcraft_color::cms::active();
+    if c.colour != colour || c.cms.as_ref().is_none_or(|old| !Arc::ptr_eq(old, &cms)) {
+        *c = Cache { clock: c.clock, colour, cms: Some(cms), ..Cache::default() };
     }
     f(c)
 }
@@ -102,6 +118,23 @@ fn lookup(key: Key) -> Option<Arc<Pixmap>> {
 }
 
 impl Cache {
+    fn matches_colour(&self, colour: &Colour) -> bool {
+        self.colour == colour.generation && self.cms.as_ref().is_some_and(|cms| Arc::ptr_eq(cms, &colour.cms))
+    }
+    fn store(&mut self, bytes: &Arc<Vec<u8>>, page: u32, level: u8, pm: Arc<Pixmap>, colour: &Colour) {
+        // A decode can finish after Edit > Color Settings invalidated the cache. Its
+        // pixels still belong to the old generation, not the new cache installed by with().
+        if !self.matches_colour(colour) {
+            return;
+        }
+        self.clock = self.clock.wrapping_add(1);
+        self.map.insert((Arc::as_ptr(bytes) as usize, page, level), Entry { owner: Arc::downgrade(bytes), pm, stamp: self.clock });
+        if level == 0 {
+            self.current_original = Some((Arc::as_ptr(bytes) as usize, page, level));
+        }
+        self.prune(FULL_BUDGET, PREVIEW_BUDGET);
+    }
+
     fn prune(&mut self, full: usize, previews: usize) {
         self.map.retain(|_, e| e.owner.strong_count() > 0);
         self.shapes.retain(|_, e| e.owner.strong_count() > 0);
@@ -126,20 +159,14 @@ impl Cache {
     }
 }
 
-fn store(bytes: &Arc<Vec<u8>>, page: u32, level: u8, pm: Arc<Pixmap>) {
-    with(|c| {
-        c.clock = c.clock.wrapping_add(1);
-        c.map.insert((Arc::as_ptr(bytes) as usize, page, level), Entry { owner: Arc::downgrade(bytes), pm, stamp: c.clock });
-        if level == 0 {
-            c.current_original = Some((Arc::as_ptr(bytes) as usize, page, level));
-        }
-        c.prune(FULL_BUDGET, PREVIEW_BUDGET);
-    });
+fn store(bytes: &Arc<Vec<u8>>, page: u32, level: u8, pm: Arc<Pixmap>, colour: &Colour) {
+    with(|c| c.store(bytes, page, level, pm, colour));
 }
 
 /// Full-resolution pixels, loaded only when a visible graphic needs them. Exports can continue
 /// using the original encoded data; screen previews never replace it.
 pub fn decoded(bytes: &Arc<Vec<u8>>, page: u32) -> Option<Arc<Pixmap>> {
+    let colour = Colour::current();
     let id = Arc::as_ptr(bytes) as usize;
     if let Some(pm) = lookup((id, page, 0)) {
         return Some(pm);
@@ -158,11 +185,15 @@ pub fn decoded(bytes: &Arc<Vec<u8>>, page: u32) -> Option<Arc<Pixmap>> {
             with(|c| {
                 c.shapes.insert((id, page), Shape { owner: Arc::downgrade(bytes), width: pm.width() as u32, height: pm.height() as u32 });
             });
-            store(bytes, page, 0, pm.clone());
+            store(bytes, page, 0, pm.clone(), &colour);
             Some(pm)
         }
         None => {
-            with(|c| c.mark_bad((id, page), bytes));
+            with(|c| {
+                if c.matches_colour(&colour) {
+                    c.mark_bad((id, page), bytes);
+                }
+            });
             None
         }
     }
@@ -203,6 +234,7 @@ pub fn mip(bytes: &Arc<Vec<u8>>, page: u32, width_pt: f64, on_screen: f64) -> Op
     if !width_pt.is_finite() || !on_screen.is_finite() {
         return None;
     }
+    let colour = Colour::current();
     let size = shape(bytes, page).or_else(|| decoded(bytes, page).map(|pm| (pm.width() as u32, pm.height() as u32)))?;
     let level = level_for(size.0, size.1, width_pt, on_screen);
     let id = Arc::as_ptr(bytes) as usize;
@@ -210,13 +242,14 @@ pub fn mip(bytes: &Arc<Vec<u8>>, page: u32, width_pt: f64, on_screen: f64) -> Op
         return Some(pm);
     }
     #[cfg(not(target_arch = "wasm32"))]
-    if level > 0
-        && !designcraft_images::is_svg(bytes)
-        && let Some(pm) = disk::load(bytes, page, level, (size.0 >> level, size.1 >> level))
+    let disk_path = (level > 0 && !designcraft_images::is_svg(bytes)).then(|| disk::path_for(bytes, page, level, &colour.cms)).flatten();
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(path) = &disk_path
+        && let Some(pm) = disk::load_path(path, (size.0 >> level, size.1 >> level))
     {
         let pm = Arc::new(pm);
         with(|c| c.stats.disk_hits = c.stats.disk_hits.saturating_add(1));
-        store(bytes, page, level, pm.clone());
+        store(bytes, page, level, pm.clone(), &colour);
         return Some(pm);
     }
     let (mut current, mut pm) = (0, None);
@@ -234,14 +267,18 @@ pub fn mip(bytes: &Arc<Vec<u8>>, page: u32, width_pt: f64, on_screen: f64) -> Op
             Some(found) => found,
             None => {
                 let half = Arc::new(halve(&pm));
-                store(bytes, page, current, half.clone());
+                store(bytes, page, current, half.clone(), &colour);
                 half
             }
         };
     }
     #[cfg(not(target_arch = "wasm32"))]
-    if level > 0 && !designcraft_images::is_svg(bytes) {
-        disk::store(bytes, page, level, &pm);
+    if let Some(path) = &disk_path
+        && colour.is_current()
+    {
+        // Keep the path captured before decoding: recomputing it here could name new
+        // colour settings even though these pixels were converted with the old ones.
+        disk::store_path(path, &pm);
     }
     Some(pm)
 }
@@ -324,7 +361,7 @@ mod preview_tests {
         let bytes = Arc::new(vec![19, 23]);
         let id = Arc::as_ptr(&bytes) as usize;
         let pm = Arc::new(Pixmap::new(3200, 3000));
-        store(&bytes, 0, 0, pm.clone());
+        store(&bytes, 0, 0, pm.clone(), &Colour::current());
         trim_originals();
         assert!(
             lookup((id, 0, 0)).is_some_and(|cached| Arc::ptr_eq(&cached, &pm)),
@@ -343,6 +380,35 @@ mod preview_tests {
         assert!(!cache.map.contains_key(&(1, 0, 0)));
         assert!(cache.map.contains_key(&(1, 0, 2)));
         assert_eq!(cache.stats.decoded_bytes, 256);
+    }
+
+    #[test]
+    fn a_completed_decode_cannot_enter_a_new_colour_generation() {
+        let bytes = Arc::new(vec![7]);
+        let key = (Arc::as_ptr(&bytes) as usize, 0, 0);
+        let old_pixels = Arc::new(Pixmap::new(8, 8));
+        let cms = designcraft_color::cms::active();
+        let mut cache = Cache { colour: 12, cms: Some(cms.clone()), ..Default::default() };
+        let old = Colour { generation: 11, cms: cms.clone() };
+        // A full decode or a mip prepared with generation 11 completes after the reset.
+        for level in [0, 2] {
+            cache.store(&bytes, 0, level, old_pixels.clone(), &old);
+        }
+        assert!(cache.map.is_empty());
+        assert_eq!(cache.stats.decoded_bytes, 0);
+        assert!(cache.current_original.is_none());
+        let current = Arc::new(Pixmap::new(8, 8));
+        let matching = Colour { generation: 12, cms };
+        cache.store(&bytes, 0, 0, current.clone(), &matching);
+        assert!(Arc::ptr_eq(&cache.map[&key].pm, &current));
+        // Replacing a named profile can replace the active context without changing
+        // the settings' names or their generation. Old work must still be refused.
+        let replacement = Arc::new(designcraft_color::cms::Cms::default());
+        let mut replaced = Cache { colour: 12, cms: Some(replacement.clone()), ..Default::default() };
+        replaced.store(&bytes, 0, 0, old_pixels, &matching);
+        assert!(replaced.map.is_empty());
+        replaced.store(&bytes, 0, 0, current.clone(), &Colour { generation: 12, cms: replacement });
+        assert!(Arc::ptr_eq(&replaced.map[&key].pm, &current));
     }
 
     #[test]

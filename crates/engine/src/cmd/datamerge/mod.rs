@@ -436,7 +436,7 @@ fn assign_page(dst: &mut Document, abs: usize, from: &Page) {
     p.guides = from.guides.clone();
     p.parent = from.parent;
     p.margins = from.margins;
-    p.columns = from.columns.clone();
+    p.columns = p.columns_from(from);
     p.local_margins = from.local_margins;
     p.width = from.width;
     p.height = from.height;
@@ -617,7 +617,7 @@ fn marker_ranges(text: &str, marker: &str) -> Vec<(usize, usize)> {
             i = end;
             continue;
         }
-        i = i.saturating_add(text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1));
+        i = i.saturating_add(text[i..].chars().next().map(char::len_utf8).unwrap_or(1));
     }
     out
 }

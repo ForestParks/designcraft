@@ -15,7 +15,7 @@ files are not kept alive by the image cache.
 
 On desktop, disposable raster/PDF previews live in the profile's `Previews` directory (including
 isolated `DESIGNCRAFT_CONFIG_DIR` profiles). Cache keys contain a version, SHA-256 of original
-bytes, PDF-page index, mip level and active colour settings. A renderer/dependency fingerprint invalidates previews
+bytes, PDF-page index, mip level, active colour settings and the effective CMYK ICC profile bytes. A renderer/dependency fingerprint invalidates previews
 when decoding code or pinned dependencies change, including development builds. Preview files preserve premultiplied pixels exactly and
 have checksums; corrupt, missing or unwritable caches fall back to originals. The disk budget
 is 512 MiB across all cache versions, evicting the oldest files first. Abandoned write temporaries older than 24 hours are cleaned at startup and after writes; recent temporaries are left alone so another instance can finish writing. PDF dimensions come from the pinned rasterizer without drawing the page, so cached PDF
@@ -35,7 +35,7 @@ Page thumbnails render on a separate native worker, one visible page at a time, 
 pages closest to the current page. Old revision results cannot replace new thumbnails. The texture cache retains at most 128 thumbnails. Local
 changes invalidate the affected spreads; global styles, parents, page structures and asset
 changes conservatively refresh all. Browser/no-thread fallback renders at most one thumbnail
-per frame. A source replacement gets new preview keys automatically.
+per frame. A source replacement gets new preview keys automatically. Decodes and mip builds retain their colour generation and immutable colour context; work finishing after a colour-setting change cannot populate the new memory cache. Disk writes keep the key captured before decoding, so old pixels cannot acquire a newer settings key. Profile fingerprints are computed once per context; replacing a named CMYK profile cannot reuse previews converted by its previous bytes.
 Document-page thumbnails follow the Pages panel's size and Show Thumbnails options; only
 visible document rows request background rendering. Colour-setting changes invalidate decoded
 image pixels and document-page thumbnail textures.
