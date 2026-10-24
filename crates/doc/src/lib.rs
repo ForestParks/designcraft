@@ -35,6 +35,7 @@ pub mod story;
 pub mod styles;
 mod swatch_refs;
 pub mod table;
+pub mod time;
 pub mod vars;
 pub mod xref;
 
@@ -143,6 +144,17 @@ pub struct BaselineGrid {
 impl Default for BaselineGrid {
     fn default() -> Self {
         BaselineGrid { start: 36.0, increment: 12.0, relative_to: GridRelative::TopOfPage, color: [140, 205, 230], view_threshold: 0.75 }
+    }
+}
+
+impl BaselineGrid {
+    /// The first grid line on `page`, measured down from the page top: `start` from the top of
+    /// the page or from its top margin. The other lines follow every `increment` below it.
+    pub fn origin(&self, page: &page::Page) -> f64 {
+        match self.relative_to {
+            GridRelative::TopOfPage => self.start,
+            GridRelative::TopMargin => self.start + page.margins.top,
+        }
     }
 }
 
@@ -402,9 +414,17 @@ pub struct DocSettings {
     /// Lock Zero Point: dragging from the ruler corner leaves it where it is.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub zero_point_locked: bool,
+    /// View › Grids & Guides › Lock Column Guides (IDML `ColumnGuideLocked`): column guides can't
+    /// be dragged. On in new documents, as in InDesign.
+    #[serde(skip_serializing_if = "is_true")]
+    pub column_guides_locked: bool,
     /// The fill and stroke new shapes are drawn with: what the Tools panel's proxy shows and sets
     /// with nothing selected (InDesign's document defaults).
     pub new_object: NewObjectColors,
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 fn is_origin(p: &[f64; 2]) -> bool {
@@ -465,6 +485,7 @@ impl Default for DocSettings {
             ruler_origin: RulerOrigin::Spread,
             zero_point: [0.0, 0.0],
             zero_point_locked: false,
+            column_guides_locked: true,
             new_object: NewObjectColors::default(),
         }
     }

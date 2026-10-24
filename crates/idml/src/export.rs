@@ -8,7 +8,7 @@ use designcraft_doc::{
     CharAttrs, CharFormat, ColumnsKind, Content, Document, Item, ListType, PageSide, ParaAttrs, ParaFormat, Rule, Shape, SpanColumns, Spread, Story,
     TextFrameOptions, story as st,
 };
-use designcraft_geom::{Affine, PathData, Rect};
+use designcraft_geom::{Affine, PathData};
 
 use crate::names::{self, CHAR_BUILTINS, OBJECT_BUILTINS, PARA_BUILTINS, escape_id, num, pt};
 use crate::xml::{El, Node, document, document_with_pi};
@@ -177,7 +177,7 @@ impl<'a> Ex<'a> {
     }
 
     fn assign_swatch_ids(&mut self) {
-        let mut used: HashSet<String> = ["Swatch/None", "Color/Paper", "Color/Black", "Color/Registration"].iter().map(|s| s.to_string()).collect();
+        let mut used: HashSet<String> = ["Swatch/None", "Color/Paper", "Color/Black", "Color/Registration"].iter().map(ToString::to_string).collect();
         self.swatch_ids.insert(swatch::NONE.into(), "Swatch/None".into());
         self.swatch_ids.insert(swatch::PAPER.into(), "Color/Paper".into());
         self.swatch_ids.insert(swatch::BLACK.into(), "Color/Black".into());
@@ -309,28 +309,7 @@ impl<'a> Ex<'a> {
             );
         }
         for t in &d.styles.mojikumi_tables {
-            let mut e = El::new("MojikumiTable").attr("Self", format!("MojikumiTable/{}", escape_id(&t.name))).attr("Name", &t.name);
-            if !t.based_on.is_empty() {
-                e.set("BasedOnMojikumiSet", &t.based_on);
-            }
-            if !t.overrides.is_empty() {
-                let mut list = El::new("OverrideMojikumiAkiList");
-                for r in &t.overrides {
-                    list.push(
-                        El::new("OverrideMojikumiAkiType")
-                            .attr("TargetMojikumiClass", r.target_class)
-                            .attr("SideMojikumiClass", r.side_class)
-                            .attr("SideIsAfterTarget", bool_s(r.after))
-                            .attr("Minimum", num(r.minimum))
-                            .attr("Desired", num(r.desired))
-                            .attr("Maximum", num(r.maximum))
-                            .attr("CompressionPriority", r.priority)
-                            .attr("AkiDoesNotFloat", bool_s(r.does_not_float)),
-                    );
-                }
-                e.push(El::new("Properties").child(list));
-            }
-            root.push(e);
+            root.push(mojikumi_table_el(t));
         }
         root.push(El::new("idPkg:Graphic").attr("src", "Resources/Graphic.xml"));
         root.push(El::new("idPkg:Fonts").attr("src", "Resources/Fonts.xml"));
@@ -364,28 +343,7 @@ impl<'a> Ex<'a> {
         }
         // IDML lists layers back to front.
         for l in d.layers.iter().rev() {
-            let color = match names::layer_color_out(l.color) {
-                Some(n) => p("LayerColor", "enumeration", n),
-                None => {
-                    let mut e = El::new("LayerColor").attr("type", "list");
-                    for c in l.color {
-                        e.push(p("ListItem", "double", num(c as f64)));
-                    }
-                    e
-                }
-            };
-            let el = El::new("Layer")
-                .attr("Self", uid(l.id.0))
-                .attr("Name", &l.name)
-                .attr("Visible", bool_s(l.visible))
-                .attr("Locked", bool_s(l.locked))
-                .attr("IgnoreWrap", bool_s(l.suppress_wrap_when_hidden))
-                .attr("ShowGuides", bool_s(l.show_guides))
-                .attr("LockGuides", "false")
-                .attr("UI", "true")
-                .attr("Expendable", "true")
-                .attr("Printable", bool_s(l.printable));
-            root.push(with_props(el, vec![color]));
+            root.push(layer_el(l));
         }
         for (name, _) in masters {
             root.push(El::new("idPkg:MasterSpread").attr("src", name));
@@ -769,7 +727,7 @@ impl<'a> Ex<'a> {
                     },
                 )
                 .attr("CreatePrimaryTextFrame", bool_s(s.primary_text_frame))
-                .attr("ColumnGuideLocked", "true")
+                .attr("ColumnGuideLocked", bool_s(s.column_guides_locked))
                 .attr("MasterTextFrame", bool_s(s.primary_text_frame))
                 .attr("SnippetImportUsesOriginalLocation", "false"),
         );
@@ -1570,6 +1528,7 @@ impl<'a> Ex<'a> {
         }
         n!(keep_with_next, "KeepWithNext");
         b!(keep_lines_together, "KeepLinesTogether");
+        b!(ignore_optical_margin, "IgnoreEdgeAlignment");
         b!(keep_all_lines, "KeepAllLinesTogether");
         n!(keep_first, "KeepFirstLines");
         n!(keep_last, "KeepLastLines");
@@ -1828,33 +1787,7 @@ impl<'a> Ex<'a> {
                 .attr("ItemTransform", format!("1 0 0 1 {} {}", num(pg.x - ox), num(-oy)))
                 .child(margin_el(pg));
             let mut pe = pe;
-            // Ruler guides, measured from the ruler origin written in the preferences: the
-            // spread's top left, the page's, or the spine (the import reads them the same way).
-            let left = sp.pages.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
-            let left = if left.is_finite() { left } else { 0.0 };
-            let spine = sp.pages.iter().map(|p| p.x - left).filter(|x| *x > 1e-6).fold(f64::INFINITY, f64::min);
-            let spine = if spine.is_finite() && facing { spine } else { 0.0 };
-            let origin_x = match d.settings.ruler_origin {
-                designcraft_doc::RulerOrigin::Spread => left,
-                designcraft_doc::RulerOrigin::Page => pg.x,
-                designcraft_doc::RulerOrigin::Spine => left + spine,
-            };
-            for g in &pg.guides {
-                let vertical = g.orientation == designcraft_doc::Orientation::Vertical;
-                let mut ge = El::new("Guide")
-                    .attr("Self", format!("{}g{}", uid(pg.id.0), pe.elements().count()))
-                    .attr("Orientation", if vertical { "Vertical" } else { "Horizontal" })
-                    .attr("Location", num(if vertical { g.position - origin_x } else { g.position }))
-                    .attr("FitToPage", bool_s(!g.spread))
-                    .attr("ViewThreshold", "5")
-                    .attr("Locked", bool_s(g.locked))
-                    .attr("PageIndex", (first_page + i).to_string())
-                    .attr("GuideType", if g.liquid { "Liquid" } else { "Ruler" });
-                if let Some(l) = g.layer {
-                    ge.set("ItemLayer", uid(l.0));
-                }
-                pe.push(ge);
-            }
+            push_page_guides(d, sp, pg, &mut pe, first_page + i);
             el.push(pe);
         }
         let origin = Affine::translate((-ox, -oy));
@@ -2012,12 +1945,21 @@ impl<'a> Ex<'a> {
         }
         if let Content::Text(t) = &it.content {
             el.push(text_frame_pref(&t.options, &self.sw(&t.options.column_rule_color)));
-            if let Some((start, inc)) = t.options.baseline_grid {
+            if let Some(g) = t.options.baseline_grid {
                 el.push(
                     El::new("BaselineFrameGridOption")
                         .attr("UseCustomBaselineFrameGrid", "true")
-                        .attr("StartingOffsetForBaselineFrameGrid", num(start))
-                        .attr("BaselineFrameGridIncrement", num(inc)),
+                        .attr("StartingOffsetForBaselineFrameGrid", num(g.start))
+                        .attr(
+                            "BaselineFrameGridRelativeOption",
+                            match g.relative_to {
+                                designcraft_doc::FrameGridRelative::TopOfPage => "TopOfPageOfBaselineFrameGridRelativeOption",
+                                designcraft_doc::FrameGridRelative::TopMargin => "TopOfMarginOfBaselineFrameGridRelativeOption",
+                                designcraft_doc::FrameGridRelative::TopOfFrame => "TopOfFrameOfBaselineFrameGridRelativeOption",
+                                designcraft_doc::FrameGridRelative::TopInset => "TopOfInsetOfBaselineFrameGridRelativeOption",
+                            },
+                        )
+                        .attr("BaselineFrameGridIncrement", num(g.increment)),
                 );
             }
         }
@@ -2285,8 +2227,11 @@ impl<'a> Ex<'a> {
             .attr("StoryTitle", "$ID/");
         el.push(
             El::new("StoryPreference")
-                .attr("OpticalMarginAlignment", "false")
-                .attr("OpticalMarginSize", "12")
+                .attr("OpticalMarginAlignment", bool_s(s.optical_margin.on))
+                .attr(
+                    "OpticalMarginSize",
+                    num(designcraft_doc::OpticalMargin::clamp_size(s.optical_margin.size).unwrap_or(designcraft_doc::OpticalMargin::DEFAULT_SIZE)),
+                )
                 .attr("FrameType", "TextFrameType")
                 .attr("StoryOrientation", if s.vertical { "Vertical" } else { "Horizontal" })
                 .attr(
@@ -2414,6 +2359,7 @@ impl<'a> Ex<'a> {
                                     object_point,
                                     ref_point,
                                     keep_within_column,
+                                    spine_relative,
                                 } => El::new("AnchoredObjectSetting")
                                     .attr("AnchoredPosition", "Anchored")
                                     .attr("AnchorPoint", names::anchor_out(*object_point))
@@ -2424,7 +2370,8 @@ impl<'a> Ex<'a> {
                                     // IDML measures a left-aligned object's X offset leftwards.
                                     .attr("AnchorXoffset", num(if *ref_point % 3 == 0 { 0.0 - *x_offset } else { *x_offset }))
                                     .attr("AnchorYoffset", num(*y_offset))
-                                    .attr("PinPosition", bool_s(*keep_within_column)),
+                                    .attr("PinPosition", bool_s(*keep_within_column))
+                                    .attr("SpineRelative", bool_s(*spine_relative)),
                             };
                             e.push(setting);
                             out.push(Node::El(e));
@@ -2797,13 +2744,45 @@ impl<'a> Ex<'a> {
                         ce.set(&format!("{side}StrokePriority"), priority);
                     }
                 }
-                for psr in self.story_paras(&cell.text) {
+                let mut paras = self.story_paras(&cell.text);
+                // A graphic cell holds its image as an inline object in the cell's first paragraph.
+                if let Some(g) = &cell.graphic
+                    && let Some(object) = self.cell_graphic_el(g)
+                {
+                    // The cell clips its graphic on screen and in PDF; IDML does so only when asked.
+                    ce.set("ClipContentToCell", bool_s(true));
+                    let mut range = self.csr_el(&CharFormat::default());
+                    range.push(object);
+                    match paras.first_mut() {
+                        Some(first) => first.push(range),
+                        None => {
+                            let mut psr = self.psr_el(&ParaFormat::default());
+                            psr.push(range);
+                            paras.push(psr);
+                        }
+                    }
+                }
+                for psr in paras {
                     ce.push(psr);
                 }
                 el.push(ce);
             }
         }
         el
+    }
+
+    /// The frame of a table cell's graphic: an inline `Rectangle` around the shown image, or `None`
+    /// when the graphic's asset is missing.
+    fn cell_graphic_el(&mut self, g: &designcraft_doc::Graphic) -> Option<El> {
+        self.d.assets.get(&g.asset)?;
+        let shown = g.xf.transform_rect_bbox(designcraft_geom::Rect::new(0.0, 0.0, g.size.0, g.size.1));
+        let layer = self.d.layers.first().map(|l| l.id).unwrap_or(designcraft_doc::ids::LayerId(0));
+        let mut item = Item::new(designcraft_doc::ids::ItemId(0), layer, Shape::Rectangle, designcraft_geom::shapes::rectangle(shown));
+        item.content = Content::Graphic(g.clone());
+        let mut el = self.item_el(&item, Affine::IDENTITY);
+        el.set("Self", self.fresh());
+        el.push(El::new("AnchoredObjectSetting").attr("AnchoredPosition", "InlinePosition").attr("AnchorYoffset", "0"));
+        Some(el)
     }
 
     fn psr_el(&mut self, pf: &ParaFormat) -> El {
@@ -2901,8 +2880,9 @@ impl Group {
 
 fn margin_el(pg: &designcraft_doc::Page) -> El {
     let m = pg.margin_rect();
-    let cols = designcraft_doc::column_rects(Rect::new(0.0, 0.0, m.width(), m.height()), pg.columns.count.max(1), pg.columns.gutter);
-    let pos: Vec<String> = cols.iter().flat_map(|c| [num(c.x0), num(c.x1)]).collect();
+    // Dragged column guides that still fit the margin box are written as they stand, so they
+    // survive the round trip; otherwise the even split, which InDesign writes for unmoved columns.
+    let pos: Vec<String> = pg.columns.edges(m.width()).into_iter().map(num).collect();
     El::new("MarginPreference")
         .attr("ColumnCount", pg.columns.count.max(1))
         .attr("ColumnGutter", num(pg.columns.gutter))
@@ -3162,6 +3142,90 @@ fn metadata_xmp(d: &Document) -> String {
     )
 }
 
+/// The page's ruler guides, measured from the ruler origin written in the preferences.
+fn push_page_guides(d: &Document, sp: &Spread, pg: &designcraft_doc::Page, pe: &mut El, page_index: usize) {
+    let facing = d.settings.facing_pages;
+    // Ruler guides, measured from the ruler origin written in the preferences: the
+    // spread's top left, the page's, or the spine (the import reads them the same way).
+    let left = sp.pages.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+    let left = if left.is_finite() { left } else { 0.0 };
+    let spine = sp.pages.iter().map(|p| p.x - left).filter(|x| *x > 1e-6).fold(f64::INFINITY, f64::min);
+    let spine = if spine.is_finite() && facing { spine } else { 0.0 };
+    let origin_x = match d.settings.ruler_origin {
+        designcraft_doc::RulerOrigin::Spread => left,
+        designcraft_doc::RulerOrigin::Page => pg.x,
+        designcraft_doc::RulerOrigin::Spine => left + spine,
+    };
+    for g in &pg.guides {
+        let vertical = g.orientation == designcraft_doc::Orientation::Vertical;
+        let mut ge = El::new("Guide")
+            .attr("Self", format!("{}g{}", uid(pg.id.0), pe.elements().count()))
+            .attr("Orientation", if vertical { "Vertical" } else { "Horizontal" })
+            .attr("Location", num(if vertical { g.position - origin_x } else { g.position }))
+            .attr("FitToPage", bool_s(!g.spread))
+            .attr("ViewThreshold", "5")
+            .attr("Locked", bool_s(g.locked))
+            .attr("PageIndex", page_index.to_string())
+            .attr("GuideType", if g.liquid { "Liquid" } else { "Ruler" });
+        if let Some(l) = g.layer {
+            ge.set("ItemLayer", uid(l.0));
+        }
+        pe.push(ge);
+    }
+}
+
+/// A `MojikumiTable` element with its spacing overrides.
+fn mojikumi_table_el(t: &designcraft_doc::cjk::MojikumiTable) -> El {
+    let mut e = El::new("MojikumiTable").attr("Self", format!("MojikumiTable/{}", escape_id(&t.name))).attr("Name", &t.name);
+    if !t.based_on.is_empty() {
+        e.set("BasedOnMojikumiSet", &t.based_on);
+    }
+    if !t.overrides.is_empty() {
+        let mut list = El::new("OverrideMojikumiAkiList");
+        for r in &t.overrides {
+            list.push(
+                El::new("OverrideMojikumiAkiType")
+                    .attr("TargetMojikumiClass", r.target_class)
+                    .attr("SideMojikumiClass", r.side_class)
+                    .attr("SideIsAfterTarget", bool_s(r.after))
+                    .attr("Minimum", num(r.minimum))
+                    .attr("Desired", num(r.desired))
+                    .attr("Maximum", num(r.maximum))
+                    .attr("CompressionPriority", r.priority)
+                    .attr("AkiDoesNotFloat", bool_s(r.does_not_float)),
+            );
+        }
+        e.push(El::new("Properties").child(list));
+    }
+    e
+}
+
+/// A `Layer` element with its colour property.
+fn layer_el(l: &designcraft_doc::Layer) -> El {
+    let color = match names::layer_color_out(l.color) {
+        Some(n) => p("LayerColor", "enumeration", n),
+        None => {
+            let mut e = El::new("LayerColor").attr("type", "list");
+            for c in l.color {
+                e.push(p("ListItem", "double", num(c as f64)));
+            }
+            e
+        }
+    };
+    let el = El::new("Layer")
+        .attr("Self", uid(l.id.0))
+        .attr("Name", &l.name)
+        .attr("Visible", bool_s(l.visible))
+        .attr("Locked", bool_s(l.locked))
+        .attr("IgnoreWrap", bool_s(l.suppress_wrap_when_hidden))
+        .attr("ShowGuides", bool_s(l.show_guides))
+        .attr("LockGuides", "false")
+        .attr("UI", "true")
+        .attr("Expendable", "true")
+        .attr("Printable", bool_s(l.printable));
+    with_props(el, vec![color])
+}
+
 /// A text variable definition with its type's settings element.
 fn text_variable_el(v: &designcraft_doc::vars::TextVariable) -> El {
     use designcraft_doc::vars::{Use, VarKind};
@@ -3303,6 +3367,10 @@ impl Ex<'_> {
         if let Some(v) = a.kenten_overprint_stroke {
             el.set("KentenOverprintStroke", crate::cjk::overprint_out(v));
         }
+        self.shatai_chars(el, a);
+    }
+
+    fn shatai_chars(&self, el: &mut El, a: &CharAttrs) {
         if let Some(v) = a.shatai_magnification {
             el.set("ShataiMagnification", num(v));
         }

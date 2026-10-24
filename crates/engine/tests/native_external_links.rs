@@ -65,7 +65,7 @@ fn native_working_links_obey_automation_read_roots() {
     let path = inside.join("linked.designcraft");
     session.execute("file.saveAs", &json!({"path": path, "embedImages": false})).unwrap();
     let original = std::fs::read(&path).unwrap();
-    let roots = AutomationRoots::new(Some(&inside), Some(&inside)).unwrap().unwrap();
+    let roots = AutomationRoots::new(&[&inside], &[&inside]).unwrap().unwrap();
     confine(Some(&roots), || {
         let mut opened = Session::new();
         let result = opened.execute("file.open", &json!({"path": path})).unwrap();

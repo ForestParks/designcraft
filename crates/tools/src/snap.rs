@@ -31,6 +31,7 @@ pub fn snap_point(cx: &ToolContext, sr: SpreadRef, p: Point) -> (Point, Vec<Over
             x_edges: [true, true, true],
             y_edges: [true, true, true],
             exclude: &[],
+            exclude_guides: &[],
             copying: false,
             lengths: [None, None],
             angle: None,
@@ -203,7 +204,7 @@ fn match_rotation(cx: &ToolContext, req: &SnapRequest<'_>, zone_length: f64) -> 
     let mut seen = HashSet::new();
     if let Some(spread) = cx.doc.spread(req.spread) {
         for item in &spread.items {
-            push_rotation(&mut best, cx.selection, req, item, Affine::IDENTITY, false, 0, &mut seen, proposed, tol);
+            push_rotation(&mut best, cx.selection, req, item, Walk::ROOT, &mut seen, (proposed, tol));
         }
     }
     if shows_parent_items(cx, req) {
@@ -222,7 +223,24 @@ fn push_parent_rotations(
     tol: f64,
 ) {
     for (item, _) in shown_parent_items(cx.doc, req.spread) {
-        push_rotation(best, cx.selection, req, item, Affine::IDENTITY, false, 0, seen_items, proposed, tol);
+        push_rotation(best, cx.selection, req, item, Walk::ROOT, seen_items, (proposed, tol));
+    }
+}
+
+/// Where a recursive walk over an item tree stands: the parent's absolute transform, whether an
+/// ancestor was skipped, and how deep it is.
+#[derive(Clone, Copy)]
+struct Walk {
+    ancestor: Affine,
+    skipped: bool,
+    depth: usize,
+}
+
+impl Walk {
+    const ROOT: Walk = Walk { ancestor: Affine::IDENTITY, skipped: false, depth: 0 };
+
+    fn child(self, ancestor: Affine, skipped: bool) -> Walk {
+        Walk { ancestor, skipped, depth: self.depth + 1 }
     }
 }
 
@@ -231,13 +249,11 @@ fn push_rotation(
     selection: &Selection,
     req: &SnapRequest<'_>,
     item: &Item,
-    ancestor: Affine,
-    skipped: bool,
-    depth: usize,
+    walk: Walk,
     seen: &mut HashSet<ItemId>,
-    proposed: f64,
-    tol: f64,
+    (proposed, tol): (f64, f64),
 ) {
+    let Walk { ancestor, skipped, depth } = walk;
     if depth >= ALIGN_GROUP_DEPTH || !seen.insert(item.id) || item.hidden {
         return;
     }
@@ -253,7 +269,7 @@ fn push_rotation(
         return;
     }
     for child in item.children() {
-        push_rotation(best, selection, req, child, abs, skip, depth + 1, seen, proposed, tol);
+        push_rotation(best, selection, req, child, walk.child(abs, skip), seen, (proposed, tol));
     }
 }
 
@@ -392,12 +408,14 @@ fn grid_origin(cx: &ToolContext, req: &SnapRequest<'_>, axis: Axis) -> Option<f6
 
 /// Baseline grid. No overlay.
 ///
-/// Lines are `page.y0 + start + n * increment` for n >= 0 while the line is inside the page
-/// (the bottom edge is not a line, matching the canvas). An increment of 0 or less skips the
-/// pass. `relative_to` and `view_threshold` are not read, and hiding the baseline grid does not
-/// turn this off. Only a page the rect crosses on x contributes.
+/// Lines are `page.y0 + origin + n * increment` for n >= 0 while the line is inside the page
+/// (the bottom edge is not a line, matching the canvas), `origin` from
+/// [`BaselineGrid::origin`](designcraft_doc::BaselineGrid::origin). An increment of 0 or less
+/// skips the pass. `view_threshold` is not read, and hiding the baseline grid does not turn this
+/// off. Only a page the rect crosses on x contributes. A dragged ruler guide
+/// ([`Gesture::Guide`]) doesn't snap to it.
 fn pass_baseline(cx: &ToolContext, req: &SnapRequest<'_>, axis: Axis, tol: f64) -> Option<AxisHit> {
-    if !matches!(axis, Axis::Y) || !cx.snap.snap_to_guides {
+    if !matches!(axis, Axis::Y) || !cx.snap.snap_to_guides || matches!(req.gesture, Gesture::Guide) {
         return None;
     }
     let baseline = &cx.doc.settings.baseline_grid;
@@ -415,7 +433,10 @@ fn pass_baseline(cx: &ToolContext, req: &SnapRequest<'_>, axis: Axis, tol: f64) 
         if !ranges_overlap(moving_lo, moving_hi, lo, hi) {
             continue;
         }
-        let origin = bounds.y0 + baseline.start;
+        let origin = bounds.y0 + baseline.origin(page);
+        if !origin.is_finite() {
+            continue;
+        }
         offer_enabled(&mut best, req.rect, flags, axis, tol, |v| nearest_baseline(v, origin, increment, bounds.y0, bounds.y1));
     }
     best.map(|b| b.hit)
@@ -905,7 +926,7 @@ fn dimension_lengths(cx: &ToolContext, req: &SnapRequest<'_>) -> Vec<f64> {
     let mut seen = HashSet::new();
     if let Some(sp) = cx.doc.spread(req.spread) {
         for item in &sp.items {
-            push_own_lengths(&mut out, cx.selection, req, item, Affine::IDENTITY, false, 0, &mut seen);
+            push_own_lengths(&mut out, cx.selection, req, item, Walk::ROOT, &mut seen);
         }
     }
     if shows_parent_items(cx, req) {
@@ -914,16 +935,8 @@ fn dimension_lengths(cx: &ToolContext, req: &SnapRequest<'_>) -> Vec<f64> {
     out
 }
 
-fn push_own_lengths(
-    out: &mut Vec<f64>,
-    selection: &Selection,
-    req: &SnapRequest<'_>,
-    item: &Item,
-    ancestor: Affine,
-    skipped: bool,
-    depth: usize,
-    seen: &mut HashSet<ItemId>,
-) {
+fn push_own_lengths(out: &mut Vec<f64>, selection: &Selection, req: &SnapRequest<'_>, item: &Item, walk: Walk, seen: &mut HashSet<ItemId>) {
+    let Walk { ancestor, skipped, depth } = walk;
     if depth >= ALIGN_GROUP_DEPTH || !seen.insert(item.id) || item.hidden {
         return;
     }
@@ -934,7 +947,7 @@ fn push_own_lengths(
     let skip = skipped || align_skips_item(selection, req, item.id);
     if item.is_group() && !item.children().is_empty() {
         for child in item.children() {
-            push_own_lengths(out, selection, req, child, abs, skip, depth + 1, seen);
+            push_own_lengths(out, selection, req, child, walk.child(abs, skip), seen);
         }
         return;
     }
@@ -992,7 +1005,7 @@ fn stroke_outset(item: &Item) -> f64 {
 
 fn push_parent_lengths(out: &mut Vec<f64>, cx: &ToolContext, req: &SnapRequest<'_>, seen_items: &mut HashSet<ItemId>) {
     for (item, _) in shown_parent_items(cx.doc, req.spread) {
-        push_own_lengths(out, cx.selection, req, item, Affine::IDENTITY, false, 0, seen_items);
+        push_own_lengths(out, cx.selection, req, item, Walk::ROOT, seen_items);
     }
 }
 
@@ -1000,7 +1013,8 @@ fn push_parent_lengths(out: &mut Vec<f64>, cx: &ToolContext, req: &SnapRequest<'
 ///
 /// A page guide attracts when the moving rect overlaps that page on the other axis. A spread
 /// guide uses the spread bounds. Locked guides are included, and so are the guides a page shows
-/// from its parent page. A guide is a target only when `Guide::visible_in` accepts it.
+/// from its parent page. A guide is a target only when `Guide::visible_in` accepts it, and not
+/// when the request excludes it (the guides being dragged).
 fn pass_guides(cx: &ToolContext, req: &SnapRequest<'_>, axis: Axis, tol: f64) -> Option<AxisHit> {
     if !cx.snap.snap_to_guides || !cx.snap.show_guides {
         return None;
@@ -1010,10 +1024,15 @@ fn pass_guides(cx: &ToolContext, req: &SnapRequest<'_>, axis: Axis, tol: f64) ->
     let flags = axis_flags(req, axis);
     let (moving_lo, moving_hi) = perp_ends(req.rect, axis);
     let mut best: Option<Best> = None;
-    for page in &sp.pages {
+    for (pi, page) in sp.pages.iter().enumerate() {
         let page_bounds = page.bounds();
-        // The page's own guides, then those it shows from its parent page.
-        for guide in page.guides.iter().cloned().chain(cx.doc.parent_guides(page)) {
+        // The page's own guides, less the excluded ones, then those it shows from its parent page.
+        let own = page
+            .guides
+            .iter()
+            .enumerate()
+            .filter(|&(gi, _)| !req.exclude_guides.contains(&designcraft_doc::GuideSel { spread: req.spread, page: pi, index: gi }));
+        for guide in own.map(|(_, g)| g.clone()).chain(cx.doc.parent_guides(page)) {
             if !guide.visible_in(cx.doc) || !guide.position.is_finite() || guide.orientation != axis_orientation(axis) {
                 continue;
             }
@@ -1076,11 +1095,11 @@ fn pass_align(cx: &ToolContext, req: &SnapRequest<'_>, axis: Axis, tol: f64) -> 
     let mut best: Option<Best> = None;
     if let Some(sp) = cx.doc.spread(req.spread) {
         for page in &sp.pages {
-            offer_box(&mut best, req.rect, flags, axis, page.bounds(), tol, cx.snap.align_edges, cx.snap.align_centers);
+            offer_box(&mut best, req.rect, flags, axis, page.bounds(), tol, (cx.snap.align_edges, cx.snap.align_centers));
         }
         for item in &sp.items {
             let Some(rect) = item_target_rect(cx.selection, req, item) else { continue };
-            offer_box(&mut best, req.rect, flags, axis, rect, tol, cx.snap.align_edges, cx.snap.align_centers);
+            offer_box(&mut best, req.rect, flags, axis, rect, tol, (cx.snap.align_edges, cx.snap.align_centers));
         }
     }
     if shows_parent_items(cx, req) {
@@ -1178,7 +1197,7 @@ fn group_box(item: &Item, seen: &mut HashSet<ItemId>, depth: usize, filter: Opti
 fn offer_parent_items(best: &mut Option<Best>, cx: &ToolContext, req: &SnapRequest<'_>, flags: [bool; 3], axis: Axis, tol: f64) {
     for (item, dx) in shown_parent_items(cx.doc, req.spread) {
         let Some(rect) = item_target_rect(cx.selection, req, item) else { continue };
-        offer_box(best, req.rect, flags, axis, shift_x(rect, dx), tol, cx.snap.align_edges, cx.snap.align_centers);
+        offer_box(best, req.rect, flags, axis, shift_x(rect, dx), tol, (cx.snap.align_edges, cx.snap.align_centers));
     }
 }
 
@@ -1272,7 +1291,7 @@ fn offer_line(best: &mut Option<Best>, moving: Rect, flags: [bool; 3], axis: Axi
     }
 }
 
-fn offer_box(best: &mut Option<Best>, moving: Rect, flags: [bool; 3], axis: Axis, target: Rect, tol: f64, edges: bool, centers: bool) {
+fn offer_box(best: &mut Option<Best>, moving: Rect, flags: [bool; 3], axis: Axis, target: Rect, tol: f64, (edges, centers): (bool, bool)) {
     let (m0, m_mid, m1) = axis_triple(moving, axis);
     let (t0, t_mid, t1) = axis_triple(target, axis);
     let [use_left, use_mid, use_right] = flags;
@@ -1427,6 +1446,7 @@ mod tests {
             x_edges: [false, false, false],
             y_edges: [true, true, true],
             exclude: &[],
+            exclude_guides: &[],
             copying: false,
             lengths: [None, None],
             angle: None,
@@ -1443,6 +1463,7 @@ mod tests {
             x_edges: [true, true, true],
             y_edges: [false, false, false],
             exclude,
+            exclude_guides: &[],
             copying: false,
             lengths: [None, None],
             angle: None,
@@ -1475,6 +1496,7 @@ mod tests {
                     x_edges: [false, false, false],
                     y_edges: [true, true, true],
                     exclude: &[moving],
+                    exclude_guides: &[],
                     copying: false,
                     lengths: [None, None],
                     angle: None,
@@ -1504,6 +1526,7 @@ mod tests {
                 x_edges: [true, true, true],
                 y_edges: [false, false, false],
                 exclude: &[moving],
+                exclude_guides: &[],
                 copying: false,
                 lengths: [None, None],
                 angle: None,
@@ -1513,6 +1536,28 @@ mod tests {
         );
         assert!((hit.delta.x - 3.5).abs() < 1e-6);
         assert!(hit.guides.is_empty());
+    }
+
+    /// A dragged guide is not its own target: excluded, the guide at 104 doesn't pull a line at 102.
+    /// Nor does the baseline grid pull it.
+    #[test]
+    fn excluded_guide_is_not_a_target() {
+        let far = Rect::new(400.0, 400.0, 420.0, 420.0);
+        let (doc, _, _) = doc_with_items(far, far, 104.0);
+        let cache = Cache::new();
+        let layout = CanvasLayout::new(&doc, false);
+        let sel = Selection::default();
+        let cx = ctx_on(&doc, &sel, &cache, &layout);
+        let line = Rect::new(102.0, 100.0, 102.0, 300.0);
+        let dragged = [designcraft_doc::GuideSel { spread: SpreadRef::Doc(0), page: 0, index: 0 }];
+        let hit = snap(&cx, move_req(line, &[]));
+        assert!((hit.delta.x - 2.0).abs() < 1e-6, "{:?}", hit.delta);
+        let hit = snap(&cx, SnapRequest { exclude_guides: &dragged, ..move_req(line, &[]) });
+        assert_eq!(hit.delta.x, 0.0);
+        // A dragged guide passes the baseline grid's lines (36 + 12n), which a moved object meets.
+        let flat = Rect::new(100.0, 86.0, 300.0, 86.0);
+        assert!((snap(&cx, y_req(flat)).delta.y - -2.0).abs() < 1e-6);
+        assert_eq!(snap(&cx, SnapRequest { gesture: Gesture::Guide, ..y_req(flat) }).delta.y, 0.0);
     }
 
     #[test]
@@ -1542,6 +1587,7 @@ mod tests {
                 x_edges: [true, false, false],
                 y_edges: [false, false, false],
                 exclude: &[],
+                exclude_guides: &[],
                 copying: false,
                 lengths: [None, None],
                 angle: None,
@@ -1569,6 +1615,7 @@ mod tests {
                 x_edges: [true, true, true],
                 y_edges: [false, false, false],
                 exclude: &[moving],
+                exclude_guides: &[],
                 copying: false,
                 lengths: [None, None],
                 angle: None,
@@ -1599,6 +1646,7 @@ mod tests {
                 x_edges: [false, false, true],
                 y_edges: [false, false, false],
                 exclude: &[moving],
+                exclude_guides: &[],
                 copying: false,
                 lengths: [None, None],
                 angle: None,
@@ -1630,6 +1678,7 @@ mod tests {
                 x_edges: [true, false, false],
                 y_edges: [false, false, false],
                 exclude: &[id],
+                exclude_guides: &[],
                 copying: true,
                 lengths: [None, None],
                 angle: None,
@@ -1666,6 +1715,7 @@ mod tests {
                 x_edges: [true, false, false],
                 y_edges: [false, false, false],
                 exclude: &[original],
+                exclude_guides: &[],
                 copying: true,
                 lengths: [None, None],
                 angle: None,
@@ -1752,6 +1802,22 @@ mod tests {
     }
 
     #[test]
+    fn baseline_relative_to_the_top_margin_snaps_from_the_margin() {
+        let mut doc = Document::new(&NewDocument::default());
+        std::sync::Arc::make_mut(&mut doc.spreads[0]).pages[0].margins.top = 37.0;
+        doc.settings.baseline_grid.start = 0.0;
+        doc.settings.baseline_grid.increment = 10.0;
+        doc.settings.baseline_grid.relative_to = designcraft_doc::GridRelative::TopMargin;
+        let cache = Cache::new();
+        let layout = CanvasLayout::new(&doc, false);
+        let sel = Selection::default();
+        let cx = ctx_on(&doc, &sel, &cache, &layout);
+        // Lines at 37 + 10n: a top at 58 goes up to 57, not down to the page-relative 60.
+        let hit = snap(&cx, y_req(Rect::new(100.0, 58.0, 140.0, 80.0)));
+        assert!((hit.delta.y - -1.0).abs() < 1e-6, "{}", hit.delta.y);
+    }
+
+    #[test]
     fn nearer_of_margin_and_baseline_wins() {
         // Bottom margin at 792 - 54 = 738, between baseline lines 732 and 744.
         let doc = Document::new(&NewDocument {
@@ -1793,6 +1859,7 @@ mod tests {
                 x_edges: [false, false, true],
                 y_edges: [false, false, false],
                 exclude: &[],
+                exclude_guides: &[],
                 copying: false,
                 lengths: [Some(197.0), None],
                 angle: None,
@@ -1836,6 +1903,7 @@ mod tests {
                 x_edges: [false, false, true],
                 y_edges: [false, false, false],
                 exclude: &[],
+                exclude_guides: &[],
                 copying: false,
                 lengths: [Some(82.0), None],
                 angle: None,
@@ -1871,6 +1939,7 @@ mod tests {
                 x_edges: [true, true, true],
                 y_edges: [false, false, false],
                 exclude: &[moving],
+                exclude_guides: &[],
                 copying: false,
                 lengths: [None, None],
                 angle: None,
@@ -2009,6 +2078,7 @@ mod tests {
                 x_edges: [true, true, true],
                 y_edges: [false, false, false],
                 exclude: &[],
+                exclude_guides: &[],
                 copying: false,
                 lengths: [Some(38.0), None],
                 angle: None,
@@ -2041,6 +2111,7 @@ mod tests {
                 x_edges: [false, false, false],
                 y_edges: [false, false, false],
                 exclude: &[],
+                exclude_guides: &[],
                 copying: false,
                 lengths: [None, None],
                 angle: Some(28.0),
@@ -2085,6 +2156,7 @@ mod tests {
                 x_edges: [false, false, false],
                 y_edges: [false, false, false],
                 exclude: &[],
+                exclude_guides: &[],
                 copying: false,
                 lengths: [None, None],
                 angle: Some(28.0),
@@ -2157,6 +2229,7 @@ mod tests {
                     x_edges: [false, false, false],
                     y_edges: [false, false, false],
                     exclude: &[],
+                    exclude_guides: &[],
                     copying: false,
                     lengths: [None, None],
                     angle: Some(angle),

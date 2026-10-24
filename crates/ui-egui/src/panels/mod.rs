@@ -12,6 +12,7 @@ pub mod library;
 pub mod notes;
 pub mod pages;
 pub mod properties;
+pub mod story;
 pub mod styles;
 pub mod swatches;
 pub mod table;
@@ -115,6 +116,49 @@ pub fn remember_swatch(app: &mut DesignApp, swatch: &str) {
 pub fn sel_tint(app: &DesignApp, stroke: bool) -> f32 {
     let Some(st) = app.session.active() else { return 1.0 };
     st.selection.items.first().and_then(|id| st.doc.item(*id)).map_or(1.0, |it| if stroke { it.stroke.tint } else { it.fill.tint })
+}
+
+/// The one selected ruler guide, as the X field (vertical guide) or Y field (horizontal guide)
+/// of the Control and Properties panels shows it: measured as the rulers measure, from the zero
+/// point (and the page, when rulers restart per page), in that ruler's units.
+#[derive(Clone, Copy, Debug)]
+pub struct GuideField {
+    pub guide: designcraft_doc::GuideSel,
+    pub orientation: designcraft_doc::Orientation,
+    /// Points from the ruler origin.
+    pub value: f64,
+    /// Where `value` 0 is: a spread x for a vertical guide, a y for a horizontal one.
+    pub origin: f64,
+    pub unit: designcraft_geom::Unit,
+}
+
+impl GuideField {
+    /// Which field shows it: 0 for X, 1 for Y.
+    pub fn row(&self) -> usize {
+        match self.orientation {
+            designcraft_doc::Orientation::Vertical => 0,
+            designcraft_doc::Orientation::Horizontal => 1,
+        }
+    }
+    /// The `guide.move` params that put it at `value` (as the field reads).
+    pub fn move_to(&self, value: f64) -> Value {
+        let g = self.guide;
+        json!({"spread": g.spread, "page": g.page, "index": g.index, "position": value + self.origin})
+    }
+}
+
+/// [`GuideField`] when exactly one ruler guide is selected.
+pub fn guide_field(app: &DesignApp) -> Option<GuideField> {
+    let st = app.session.active()?;
+    let [g] = st.selection.guides.as_slice() else { return None };
+    let pg = st.doc.spread(g.spread)?.pages.get(g.page)?;
+    let guide = pg.guides.get(g.index)?;
+    let (origin, unit) = match guide.orientation {
+        designcraft_doc::Orientation::Vertical => (st.doc.ruler_origin(g.spread, guide.position)?.x, st.doc.settings.horizontal_units),
+        designcraft_doc::Orientation::Horizontal => (st.doc.ruler_origin(g.spread, pg.x + pg.width / 2.0)?.y, st.doc.settings.vertical_units),
+    };
+    let value = guide.position - origin;
+    value.is_finite().then_some(GuideField { guide: *g, orientation: guide.orientation, value, origin, unit })
 }
 
 pub fn sel_info(app: &DesignApp) -> Option<SelInfo> {
@@ -221,7 +265,7 @@ pub fn preflight_errors(app: &DesignApp) -> usize {
     static MEMO: std::sync::Mutex<Option<(usize, usize)>> = std::sync::Mutex::new(None);
     let Some(st) = app.session.active() else { return 0 };
     let key = std::sync::Arc::as_ptr(&st.doc) as usize;
-    let mut g = MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = MEMO.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((k, n)) = *g
         && k == key
     {
@@ -663,18 +707,22 @@ mod font_menu_ui_tests {
         let at = field(&h, designcraft_fonts::DEFAULT_FAMILY);
         click_at(&mut h, at.center());
         assert!(h.ctx.text_edit_focused(), "the search field takes the keyboard when the menu opens");
-        h.event(egui::Event::Text("source sans".into()));
+        h.event(egui::Event::Text("source".into()));
         h.run_steps(4);
-        assert_eq!(search(&h), "source sans");
+        assert_eq!(search(&h), "source");
         assert_eq!(story_text(&mut h, story), before, "the typing went to the search, not the story");
         assert!(h.query_by_label("Source Sans 3").is_some(), "a match is listed");
-        assert!(h.query_by_label(designcraft_fonts::DEFAULT_FAMILY).is_none(), "families that don't match aren't");
+        assert!(h.query_by_label(designcraft_fonts::DEFAULT_FAMILY).is_some(), "both bundled Source families match");
+        assert!(h.query_by_label("JetBrains Mono").is_none(), "families that don't match aren't");
         // Typing highlights the first match. ↓ then ↑ exercise navigation and return to it.
-        let expected = first_match(&h, "source sans");
+        let expected = first_match(&h, "source");
+        assert_eq!(super::font_menu::keyboard_highlight(&h.ctx), Some(0));
         h.key_press(egui::Key::ArrowDown);
         h.run_steps(2);
+        assert_eq!(super::font_menu::keyboard_highlight(&h.ctx), Some(1), "Down highlights the next family");
         h.key_press(egui::Key::ArrowUp);
         h.run_steps(2);
+        assert_eq!(super::font_menu::keyboard_highlight(&h.ctx), Some(0), "Up restores the first family");
         h.key_press(egui::Key::Enter);
         h.run_steps(4);
         assert_eq!(family(&mut h), expected);
@@ -715,16 +763,20 @@ mod font_menu_ui_tests {
         let field = field.unwrap_or_else(|| panic!("{what}: the menu opens with the search field focused"));
         click_at(h, field.center());
         assert!(h.ctx.text_edit_focused(), "{what}: a click on the search field keeps the menu open");
-        h.event(egui::Event::Text("SOURCE SA".into()));
+        h.event(egui::Event::Text("SOURCE".into()));
         h.run_steps(4);
-        assert_eq!(search(h), "SOURCE SA", "{what}: the typing went to the search");
+        assert_eq!(search(h), "SOURCE", "{what}: the typing went to the search");
         assert!(h.query_by_label("Source Sans 3").is_some(), "{what}: a match is listed");
-        assert!(h.query_by_label(designcraft_fonts::DEFAULT_FAMILY).is_none(), "{what}: families that don't match aren't");
-        let expected = first_match(h, "source sa");
+        assert!(h.query_by_label(designcraft_fonts::DEFAULT_FAMILY).is_some(), "{what}: both bundled Source families match");
+        assert!(h.query_by_label("JetBrains Mono").is_none(), "{what}: families that don't match aren't");
+        let expected = first_match(h, "source");
+        assert_eq!(super::font_menu::keyboard_highlight(&h.ctx), Some(0), "{what}: typing highlights the first family");
         h.key_press(egui::Key::ArrowDown);
         h.run_steps(2);
+        assert_eq!(super::font_menu::keyboard_highlight(&h.ctx), Some(1), "{what}: Down highlights the next family");
         h.key_press(egui::Key::ArrowUp);
         h.run_steps(2);
+        assert_eq!(super::font_menu::keyboard_highlight(&h.ctx), Some(0), "{what}: Up restores the first family");
         h.key_press(egui::Key::Enter);
         h.run_steps(4);
         assert!(!h.ctx.text_edit_focused(), "{what}: the menu closed");

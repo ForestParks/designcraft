@@ -315,9 +315,16 @@ fn keyboard_shortcuts(app: &mut DesignApp, ui: &mut egui::Ui, d: &mut Dialog) {
     if !msg.is_empty() {
         ui.label(egui::RichText::new(msg).color(egui::Color32::from_rgb(240, 180, 60)));
     }
-    if ui.button(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Reset All to Defaults"))).clicked() {
-        let _ = app.run("window.resetShortcuts", json!({}));
-    }
+    ui.horizontal(|ui| {
+        if ui.button(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Reset All to Defaults"))).clicked() {
+            let _ = app.run("window.resetShortcuts", json!({}));
+        }
+        if ui.button(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Import InDesign Set…"))).clicked()
+            && let Some(msg) = crate::shortcut_import::pick_and_import(app)
+        {
+            d.fields.insert("message".into(), json!(msg));
+        }
+    });
 }
 
 /// File › Print, with the printers the system knows.
@@ -520,6 +527,15 @@ fn seed_text_frame_options(app: &DesignApp, d: &mut Dialog) {
         _ => ((inner - o.gutter * (n - 1.0)) / n).max(0.0),
     };
     let kind = |v: Value| v.as_str().unwrap_or_default().to_string();
+    // A frame without a custom baseline grid shows the document grid's start and increment.
+    let grid = o.baseline_grid.unwrap_or_else(|| {
+        let g = app.session.active().map(|s| s.doc.settings.baseline_grid.clone()).unwrap_or_default();
+        let relative_to = match g.relative_to {
+            designcraft_doc::GridRelative::TopOfPage => designcraft_doc::FrameGridRelative::TopOfPage,
+            designcraft_doc::GridRelative::TopMargin => designcraft_doc::FrameGridRelative::TopMargin,
+        };
+        designcraft_doc::FrameBaselineGrid { start: g.start, increment: g.increment, relative_to }
+    });
     let shown = json!({
         "columns": o.columns, "gutter": fm(o.gutter),
         "columnsKind": kind(serde_json::to_value(o.columns_kind).unwrap_or_default()), "columnWidth": fm(width),
@@ -535,6 +551,8 @@ fn seed_text_frame_options(app: &DesignApp, d: &mut Dialog) {
         "useMinimumHeight": o.auto_size_use_min_height, "minimumHeight": fm(o.auto_size_min_height),
         "useMinimumWidth": o.auto_size_use_min_width, "minimumWidth": fm(o.auto_size_min_width),
         "noLineBreaks": o.auto_size_no_line_breaks,
+        "customGrid": o.baseline_grid.is_some(), "gridStart": fm(grid.start), "gridIncrement": fm(grid.increment),
+        "gridRelativeTo": grid.relative_to.name(),
     });
     if let Value::Object(m) = &shown {
         for (k, v) in m {
@@ -585,6 +603,28 @@ fn text_frame_options_dialog(app: &DesignApp, ui: &mut egui::Ui, d: &mut Dialog)
                     crate::rtl::label(ui, tr("Min:"));
                     text_field(ui, d, "firstBaselineMin", 70.0);
                     ui.end_row();
+                });
+                ui.add_space(8.0);
+                crate::rtl::label(ui, egui::RichText::new(tr("Baseline Grid")).font(semibold(12.0)));
+                check(ui, d, "customGrid", tr("Use Custom Baseline Grid"));
+                ui.add_enabled_ui(d.b("customGrid"), |ui| {
+                    egui::Grid::new("tfo_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                        crate::rtl::label(ui, tr("Start:"));
+                        text_field(ui, d, "gridStart", 70.0);
+                        ui.end_row();
+                        crate::rtl::label(ui, tr("Relative To:"));
+                        translated_combo(
+                            &lang,
+                            ui,
+                            d,
+                            "gridRelativeTo",
+                            &[("page", "Top of Page"), ("margin", "Top Margin"), ("frame", "Top of Frame"), ("inset", "Top Inset")],
+                        );
+                        ui.end_row();
+                        crate::rtl::label(ui, tr("Increment Every:"));
+                        text_field(ui, d, "gridIncrement", 70.0);
+                        ui.end_row();
+                    });
                 });
             }
             "autosize" => auto_size(&lang, ui, d),
@@ -848,6 +888,30 @@ fn confirm_text_frame_options(app: &mut DesignApp, d: &mut Dialog) -> Result<Val
     for (key, what) in [("minimumHeight", "the minimum height is not a measure"), ("minimumWidth", "the minimum width is not a measure")] {
         if edited(d, key) {
             p.insert(key.into(), json!(d.m(key).filter(|v| *v >= 0.0).ok_or_else(|| bad(what))?));
+        }
+    }
+    // The custom baseline grid: off, or the fields the user changed (all of them when it is
+    // turned on, since it shows the document grid's).
+    let grid_keys = ["customGrid", "gridStart", "gridIncrement", "gridRelativeTo"];
+    if grid_keys.iter().any(|k| edited(d, k)) {
+        if d.b("customGrid") {
+            let all = edited(d, "customGrid");
+            let mut g = Map::new();
+            if all || edited(d, "gridStart") {
+                g.insert("start".into(), json!(d.m("gridStart").ok_or_else(|| bad("the baseline grid start is not a measure"))?));
+            }
+            if all || edited(d, "gridIncrement") {
+                g.insert(
+                    "increment".into(),
+                    json!(d.m("gridIncrement").filter(|v| *v > 0.0).ok_or_else(|| bad("the baseline grid increment is not a measure"))?),
+                );
+            }
+            if all || edited(d, "gridRelativeTo") {
+                g.insert("relativeTo".into(), json!(d.s("gridRelativeTo")));
+            }
+            p.insert("baselineGrid".into(), Value::Object(g));
+        } else {
+            p.insert("baselineGrid".into(), Value::Null);
         }
     }
     if p.is_empty() {
@@ -1984,8 +2048,8 @@ fn preferences(app: &crate::DesignApp, ui: &mut egui::Ui, d: &mut Dialog, max_he
                     egui::ComboBox::from_id_salt("pref_language").width(180.0).height(400.0).selected_text(crate::rtl::widget(ui, current)).show_ui(
                         ui,
                         |ui| {
-                            for (code, name) in crate::i18n::LANGUAGES {
-                                if ui.selectable_label(*code == app.ui.language, crate::rtl::widget(ui, *name)).clicked() {
+                            for (code, name) in crate::i18n::picker_languages() {
+                                if ui.selectable_label(code == app.ui.language, crate::rtl::widget(ui, name)).clicked() {
                                     // Applied by `show` right after this frame, which has `&mut DesignApp`.
                                     d.fields.insert("applyLanguage".into(), json!(code));
                                 }
@@ -2057,10 +2121,14 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
             match d.s("section").as_str() {
                 "span" => "Span Columns",
                 "bullets" => "Bullets and Numbering",
+                "keep" => "Keep Options",
+                "nested" => "Drop Caps and Nested Styles",
+                "grep" => "GREP Styles",
                 _ => "Paragraph Borders and Shading",
             },
         ),
         "justification" => crate::i18n::tr(&app.ui.language, "Justification"),
+        "hyphenation" => crate::i18n::tr(&app.ui.language, "Hyphenation Settings"),
         "insertXref" => crate::i18n::tr(&app.ui.language, "New Cross-Reference"),
         "findFont" => crate::i18n::tr(&app.ui.language, "Find/Replace Font"),
         "polygonSettings" => crate::i18n::tr(&app.ui.language, "Polygon Settings"),
@@ -2102,6 +2170,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
             "alert" => 440.0,
             "closeDocument" | "updateLink" | "deletePages" | "newWorkspace" | "pagesPanelOptions" => 380.0,
             "newDocument" => 960.0,
+            "hyphenation" => 560.0,
             "numberingSection" => 560.0,
             crate::effects_dialog::ID => 720.0,
             _ => 640.0,
@@ -2354,6 +2423,21 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                         let current = d.fields.get("current").cloned().unwrap_or_default();
                         justification(&app.ui.language, ui, &mut d, "", &current);
                     }
+                    "hyphenation" => {
+                        let current = d.fields.get("current").cloned().unwrap_or_default();
+                        let units = app.session.active().map_or(Unit::Picas, |st| st.doc.settings.horizontal_units);
+                        let preview = crate::i18n::tr(&app.ui.language, "Preview").to_string();
+                        ui.horizontal_top(|ui| {
+                            ui.vertical(|ui| hyphenation(&app.ui.language, ui, &mut d, "", &current, units));
+                            ui.add_space(24.0);
+                            check(ui, &mut d, "preview", &preview);
+                        });
+                        hyphenation_preview(app, &mut d);
+                        if let Some(st) = d.fields.get("status").and_then(Value::as_str) {
+                            ui.add_space(6.0);
+                            crate::rtl::label(ui, egui::RichText::new(st).color(ui.visuals().error_fg_color));
+                        }
+                    }
                     "insertXref" => insert_xref(app, ui, &mut d),
                     "findFont" => find_font(app, ui, &mut d),
                     "colorPicker" => color_picker(ui, &mut d),
@@ -2449,6 +2533,9 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
                         {
                             match app.session.execute("color.loadProfile", &json!({"path": path})) {
                                 Ok(_) => {
+                                    // Replayed in load order at start-up, so the latest load of a path comes last.
+                                    app.ui.color_profiles.retain(|p| p != &path);
+                                    app.ui.color_profiles.push(path);
                                     let f = app.session.execute("color.settings", &json!({})).unwrap_or_default();
                                     d.fields.insert("profiles".into(), f["profiles"].clone());
                                 }
@@ -2829,6 +2916,7 @@ pub fn show(app: &mut DesignApp, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             if matches!(d.id.as_str(), "paragraphStyleOptions" | "characterStyleOptions") && !d.b("new") {
                 check(ui, &mut d, "preview", crate::i18n::tr(&app.ui.language, "Preview"));
+                app.ui.style_preview = d.b("preview");
                 style_options_preview(app, &mut d);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3162,6 +3250,24 @@ pub fn confirm(app: &mut DesignApp) -> Result<Value, String> {
             }
             app.run("type.para", json!({"attrs": attrs}))
         }
+        "hyphenation" => {
+            // The preview goes; the edits are made once, as one undo step.
+            if d.fields.contains_key(PREVIEWED) {
+                app.session.cancel_interaction();
+            }
+            let attrs = hyphenation_edits(&d);
+            if attrs.is_empty() {
+                return Ok(Value::Null);
+            }
+            app.run("type.para", json!({"attrs": attrs})).inspect_err(|e| {
+                // The dialog stays open, with the reason, to be corrected.
+                app.status(e.clone());
+                let mut d = d;
+                d.fields.remove(PREVIEWED);
+                d.fields.insert("status".into(), json!(e));
+                app.ui.dialog = Some(d);
+            })
+        }
         "justification" => {
             let current = d.fields.get("current").cloned().unwrap_or_default();
             if let Err(e) = check_justification(&d, "", &current) {
@@ -3268,13 +3374,29 @@ pub fn confirm(app: &mut DesignApp) -> Result<Value, String> {
         }
         "pdfImport" => {
             let crop = d.s("crop");
+            // One page number, 1 or more; a blank field is page 1. A range or list ("4-5", "2,5"), a
+            // fraction or a negative is refused rather than placing some other page.
+            let raw = if d.fields.get("page").is_none_or(Value::is_null) { String::new() } else { d.s("page") };
+            let page = match raw.trim() {
+                "" => 1,
+                t => match t.parse::<u64>() {
+                    Ok(n) if n >= 1 => n,
+                    _ => {
+                        let e = "Enter a single page number; one page is placed at a time".to_string();
+                        let mut d = d;
+                        d.fields.insert("status".into(), json!(e));
+                        app.ui.dialog = Some(d);
+                        return Err(e);
+                    }
+                },
+            };
             if d.b("async") {
-                return app.confirm_pdf_import(d.n("page").unwrap_or(1.0).max(1.0) as u64, if crop.is_empty() { "crop".into() } else { crop });
+                return app.confirm_pdf_import(page, if crop.is_empty() { "crop".into() } else { crop });
             }
             if let Some(target) = d.fields.get("target").and_then(Value::as_u64) {
                 app.activate_import_target(&crate::ImportRequest { purpose: "place".into(), target: Some(target) })?;
             }
-            app.place_file(json!({"path": d.s("path"), "pdfPage": d.n("page").unwrap_or(1.0).max(1.0) as u64, "pdfCrop": if crop.is_empty() { "crop".to_string() } else { crop }}))
+            app.place_file(json!({"path": d.s("path"), "pdfPage": page, "pdfCrop": if crop.is_empty() { "crop".to_string() } else { crop }}))
         }
         "print" => {
             let pages = if d.s("range") == "all" { Value::Null } else { json!(d.s("pages")) };
@@ -3330,7 +3452,7 @@ pub fn confirm(app: &mut DesignApp) -> Result<Value, String> {
                 params["title"] = json!(title);
             }
             let name = if title.is_empty() { "Export.pdf".to_string() } else { format!("{title}.pdf") };
-            match app.services.pick_save.as_mut().and_then(|f| f(&name)) {
+            match app.pick_save(&name) {
                 Some(path) => {
                     params["path"] = json!(path);
                     crate::menus::export_pdf(app, &params)
@@ -3652,18 +3774,13 @@ fn check_paragraph_style_justification(app: &DesignApp, d: &Dialog) -> Result<()
     check_justification(d, "p.", &base)
 }
 
-fn confirm_paragraph_style_options(app: &mut DesignApp, d: &mut Dialog) -> Result<Value, String> {
-    let name = d.s("name");
-    if let Err(e) = check_paragraph_style_justification(app, d) {
-        // The caller shows the reason in the dialog's status line.
-        d.fields.insert("section".into(), json!("justify"));
-        return Err(e);
-    }
+/// The `p.*` and `c.*` dialog fields as the paragraph and character attribute maps a style
+/// command takes. `p.ruleAbove.weight` is one field of a rule (the command keeps the others).
+fn style_option_maps(d: &Dialog) -> (serde_json::Map<String, Value>, serde_json::Map<String, Value>) {
     let mut para = serde_json::Map::new();
     let mut chars = serde_json::Map::new();
     for (k, v) in &d.fields {
         if let Some(a) = k.strip_prefix("p.") {
-            // `p.ruleAbove.weight`: one field of a rule (the command keeps the others).
             match a.split_once('.') {
                 Some((attr, field)) => {
                     if let Value::Object(m) = para.entry(attr).or_insert_with(|| json!({})) {
@@ -3678,6 +3795,17 @@ fn confirm_paragraph_style_options(app: &mut DesignApp, d: &mut Dialog) -> Resul
             chars.insert(a.into(), v.clone());
         }
     }
+    (para, chars)
+}
+
+fn confirm_paragraph_style_options(app: &mut DesignApp, d: &mut Dialog) -> Result<Value, String> {
+    let name = d.s("name");
+    if let Err(e) = check_paragraph_style_justification(app, d) {
+        // The caller shows the reason in the dialog's status line.
+        d.fields.insert("section".into(), json!("justify"));
+        return Err(e);
+    }
+    let (para, chars) = style_option_maps(d);
     let based = d.s("basedOn");
     let rename = d.s("rename");
     let (r, style) = if d.b("new") {
@@ -3712,6 +3840,26 @@ fn confirm_paragraph_style_options(app: &mut DesignApp, d: &mut Dialog) -> Resul
     Ok(r)
 }
 
+/// Copies the dialog's `c.*` (and, for a paragraph style, `p.*`) fields into the preview params.
+fn fill_style_preview_fields(params: &mut Value, d: &Dialog, paragraph: bool) {
+    for (key, value) in &d.fields {
+        if let Some(attr) = key.strip_prefix("c.") {
+            params["chars"][attr] = value.clone();
+        } else if paragraph && let Some(attr) = key.strip_prefix("p.") {
+            if let Some((attr, field)) = attr.split_once('.') {
+                if params["para"][attr].is_null() {
+                    params["para"][attr] = json!({});
+                }
+                if let Some(fields) = params["para"][attr].as_object_mut() {
+                    fields.insert(field.into(), value.clone());
+                }
+            } else {
+                params["para"][attr] = value.clone();
+            }
+        }
+    }
+}
+
 /// Preview the changed style attributes through the same engine commands as OK. Renaming and
 /// export tagging have no visual effect and wait for OK, so the dialog can keep looking up the
 /// original style while the preview is visible. The interaction restores its starting document
@@ -3741,22 +3889,7 @@ fn style_options_preview(app: &mut DesignApp, d: &mut Dialog) {
     if paragraph {
         params["para"] = json!({});
     }
-    for (key, value) in &d.fields {
-        if let Some(attr) = key.strip_prefix("c.") {
-            params["chars"][attr] = value.clone();
-        } else if paragraph && let Some(attr) = key.strip_prefix("p.") {
-            if let Some((attr, field)) = attr.split_once('.') {
-                if params["para"][attr].is_null() {
-                    params["para"][attr] = json!({});
-                }
-                if let Some(fields) = params["para"][attr].as_object_mut() {
-                    fields.insert(field.into(), value.clone());
-                }
-            } else {
-                params["para"][attr] = value.clone();
-            }
-        }
-    }
+    fill_style_preview_fields(&mut params, d, paragraph);
     if let Some(based) = d.fields.get("basedOn") {
         params["basedOn"] = match based.as_str() {
             Some(designcraft_doc::NO_PARA_STYLE | designcraft_doc::NO_CHAR_STYLE) => Value::Null,
@@ -3873,270 +4006,8 @@ fn paragraph_style_options(app: &mut DesignApp, ui: &mut egui::Ui, d: &mut Dialo
                     text_field(ui, d, "x.class", 160.0);
                 });
             }
-            "nested" => {
-                crate::rtl::label(ui, egui::RichText::new(crate::i18n::tr(&app.ui.language, "Drop Caps")).font(semibold(12.0)));
-                egui::Grid::new("psdc").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                    for (label, key, max) in [
-                        ("Lines:", "dropCapLines", designcraft_compose::MAX_DROP_CAP_LINES),
-                        ("Characters:", "dropCapChars", designcraft_compose::MAX_DROP_CAP_CHARS),
-                    ] {
-                        crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, label));
-                        let v = cur(d, &format!("p.{key}"), &pv[key]).as_f64();
-                        if let Some(n) = crate::widgets::number(ui, &format!("ps{key}"), v, "", 60.0, 0) {
-                            d.fields.insert(format!("p.{key}"), json!((n.max(0.0) as u64).min(max as u64)));
-                        }
-                        ui.end_row();
-                    }
-                    crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, "Character Style:"));
-                    let style = cur(d, "p.dropCapStyle", &pv["dropCapStyle"]).as_str().unwrap_or("").to_string();
-                    let style = if style.is_empty() { designcraft_doc::NO_CHAR_STYLE.to_string() } else { style };
-                    egui::ComboBox::from_id_salt("ps_dropcap_style")
-                        .selected_text(crate::rtl::widget(ui, crate::i18n::style_name(&app.ui.language, &style)))
-                        .width(160.0)
-                        .show_ui(ui, |ui| {
-                            for c in &cnames {
-                                if ui.selectable_label(*c == style, crate::rtl::widget(ui, crate::i18n::style_name(&app.ui.language, c))).clicked() {
-                                    d.fields.insert("p.dropCapStyle".into(), json!(c));
-                                }
-                            }
-                        });
-                    ui.end_row();
-                });
-                for (label, key) in [("Align Left Edge", "dropCapAlignLeft"), ("Scale for Descenders", "dropCapScaleDescenders")] {
-                    let mut on = cur(d, &format!("p.{key}"), &pv[key]).as_bool().unwrap_or(false);
-                    if ui.checkbox(&mut on, crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, label))).changed() {
-                        d.fields.insert(format!("p.{key}"), json!(on));
-                    }
-                }
-                ui.add_space(8.0);
-                crate::rtl::label(ui, egui::RichText::new(crate::i18n::tr(&app.ui.language, "Nested Styles")).font(semibold(12.0)));
-                let mut list: Vec<Value> = cur(d, "p.nestedStyles", &pv["nestedStyles"]).as_array().cloned().unwrap_or_default();
-                let mut changed = false;
-                let mut remove = None;
-                for (i, ns) in list.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        let style = ns["style"].as_str().unwrap_or("[None]").to_string();
-                        egui::ComboBox::from_id_salt(("ns_style", i))
-                            .selected_text(crate::rtl::widget(ui, crate::i18n::style_name(&app.ui.language, &style)))
-                            .width(110.0)
-                            .show_ui(ui, |ui| {
-                                for c in &cnames {
-                                    if ui
-                                        .selectable_label(*c == style, crate::rtl::widget(ui, crate::i18n::style_name(&app.ui.language, c)))
-                                        .clicked()
-                                    {
-                                        ns["style"] = json!(c);
-                                        changed = true;
-                                    }
-                                }
-                            });
-                        let through = ns["through"].as_bool().unwrap_or(true);
-                        egui::ComboBox::from_id_salt(("ns_thr", i))
-                            .selected_text(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, if through { "through" } else { "up to" })))
-                            .width(70.0)
-                            .show_ui(ui, |ui| {
-                                for (v, l) in [(true, "through"), (false, "up to")] {
-                                    if ui.selectable_label(v == through, crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, l))).clicked() {
-                                        ns["through"] = json!(v);
-                                        changed = true;
-                                    }
-                                }
-                            });
-                        let mut n = ns["count"].as_u64().unwrap_or(1) as u32;
-                        let mut count_value = |ui: &mut egui::Ui, ns: &mut Value, changed: &mut bool| {
-                            if ui.add(egui::DragValue::new(&mut n).range(1..=999)).changed() {
-                                ns["count"] = json!(n);
-                                *changed = true;
-                            }
-                        };
-                        if !crate::i18n::category_first(&app.ui.language) {
-                            count_value(ui, ns, &mut changed);
-                        }
-                        let kind = ns["until"]["kind"].as_str().unwrap_or("words").to_string();
-                        egui::ComboBox::from_id_salt(("ns_until", i))
-                            .selected_text(crate::rtl::widget(
-                                ui,
-                                if crate::i18n::category_first(&app.ui.language) {
-                                    format!("{}:", crate::i18n::tr(&app.ui.language, &kind))
-                                } else {
-                                    crate::i18n::tr(&app.ui.language, &kind).to_owned()
-                                },
-                            ))
-                            .width(100.0)
-                            .show_ui(ui, |ui| {
-                                for k in [
-                                    "sentences",
-                                    "words",
-                                    "characters",
-                                    "letters",
-                                    "digits",
-                                    "tab",
-                                    "forcedLineBreak",
-                                    "emSpace",
-                                    "enSpace",
-                                    "dropcap",
-                                    "chars",
-                                ] {
-                                    if ui.selectable_label(k == kind, crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, k))).clicked() {
-                                        ns["until"] = if k == "chars" { json!({"kind": "chars", "chars": ":"}) } else { json!({"kind": k}) };
-                                        changed = true;
-                                    }
-                                }
-                            });
-                        if crate::i18n::category_first(&app.ui.language) {
-                            count_value(ui, ns, &mut changed);
-                        }
-                        if kind == "chars" {
-                            let mut c = ns["until"]["chars"].as_str().unwrap_or("").to_string();
-                            if ui.add(egui::TextEdit::singleline(&mut c).desired_width(40.0)).changed() {
-                                ns["until"]["chars"] = json!(c);
-                                changed = true;
-                            }
-                        }
-                        if ui
-                            .small_button("×")
-                            .on_hover_ui(|ui| {
-                                crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, "Delete"));
-                            })
-                            .clicked()
-                        {
-                            remove = Some(i);
-                        }
-                    });
-                }
-                if let Some(i) = remove {
-                    list.remove(i);
-                    changed = true;
-                }
-                if ui.button(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "New Nested Style"))).clicked() {
-                    list.push(json!({"style": cnames.get(1).cloned().unwrap_or_default(), "through": true, "count": 1, "until": {"kind": "words"}}));
-                    changed = true;
-                }
-                if changed {
-                    d.fields.insert("p.nestedStyles".into(), Value::Array(list));
-                }
-                ui.add_space(8.0);
-                crate::rtl::label(ui, egui::RichText::new(crate::i18n::tr(&app.ui.language, "Nested Line Styles")).font(semibold(12.0)));
-                let mut lines: Vec<Value> = cur(d, "p.nestedLineStyles", &pv["nestedLineStyles"]).as_array().cloned().unwrap_or_default();
-                let mut changed = false;
-                let mut remove = None;
-                for (i, l) in lines.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        let style = l["style"].as_str().unwrap_or("").to_string();
-                        egui::ComboBox::from_id_salt(("nls_style", i))
-                            .selected_text(crate::rtl::widget(ui, crate::i18n::style_name(&app.ui.language, &style)))
-                            .width(130.0)
-                            .show_ui(ui, |ui| {
-                                for c in &cnames {
-                                    if ui
-                                        .selectable_label(*c == style, crate::rtl::widget(ui, crate::i18n::style_name(&app.ui.language, c)))
-                                        .clicked()
-                                    {
-                                        l["style"] = json!(c);
-                                        changed = true;
-                                    }
-                                }
-                            });
-                        crate::rtl::label(
-                            ui,
-                            if crate::i18n::category_first(&app.ui.language) {
-                                format!("{}:", crate::i18n::tr(&app.ui.language, "lines"))
-                            } else {
-                                crate::i18n::tr(&app.ui.language, "for").to_owned()
-                            },
-                        );
-                        let mut n = l["lines"].as_u64().unwrap_or(1) as u32;
-                        if ui.add(egui::DragValue::new(&mut n).range(1..=999)).changed() {
-                            l["lines"] = json!(n);
-                            changed = true;
-                        }
-                        if !crate::i18n::category_first(&app.ui.language) {
-                            crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, if n == 1 { "line" } else { "lines" }));
-                        }
-                        if ui
-                            .small_button("×")
-                            .on_hover_ui(|ui| {
-                                crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, "Delete"));
-                            })
-                            .clicked()
-                        {
-                            remove = Some(i);
-                        }
-                    });
-                }
-                if let Some(i) = remove {
-                    lines.remove(i);
-                    changed = true;
-                }
-                if ui.button(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "New Line Style"))).clicked() {
-                    lines.push(json!({"style": cnames.get(1).cloned().unwrap_or_default(), "lines": 1}));
-                    changed = true;
-                }
-                if changed {
-                    d.fields.insert("p.nestedLineStyles".into(), Value::Array(lines));
-                }
-            }
-            "grep" => {
-                crate::rtl::label(ui, egui::RichText::new(crate::i18n::tr(&app.ui.language, "GREP Styles")).font(semibold(12.0)));
-                let mut list: Vec<Value> = cur(d, "p.grepStyles", &pv["grepStyles"]).as_array().cloned().unwrap_or_default();
-                let mut changed = false;
-                let mut remove = None;
-                for (i, g) in list.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, "Apply Style:"));
-                        let style = g["style"].as_str().unwrap_or("").to_string();
-                        egui::ComboBox::from_id_salt(("gs_style", i))
-                            .selected_text(crate::rtl::widget(ui, crate::i18n::style_name(&app.ui.language, &style)))
-                            .width(110.0)
-                            .show_ui(ui, |ui| {
-                                for c in &cnames {
-                                    if ui
-                                        .selectable_label(*c == style, crate::rtl::widget(ui, crate::i18n::style_name(&app.ui.language, c)))
-                                        .clicked()
-                                    {
-                                        g["style"] = json!(c);
-                                        changed = true;
-                                    }
-                                }
-                            });
-                        crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, "To Text:"));
-                        let mut pat = g["pattern"].as_str().unwrap_or("").to_string();
-                        let bad = grep_error(&pat).is_some();
-                        let r = ui.add(
-                            egui::TextEdit::singleline(&mut pat)
-                                .desired_width(150.0)
-                                .text_color_opt(bad.then_some(egui::Color32::from_rgb(240, 90, 90))),
-                        );
-                        if r.changed() {
-                            g["pattern"] = json!(pat);
-                            changed = true;
-                        }
-                        if ui
-                            .small_button("×")
-                            .on_hover_ui(|ui| {
-                                crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, "Delete"));
-                            })
-                            .clicked()
-                        {
-                            remove = Some(i);
-                        }
-                    });
-                    if let Some(e) = grep_error(g["pattern"].as_str().unwrap_or("")) {
-                        crate::rtl::label(ui, egui::RichText::new(e).size(11.0).color(egui::Color32::from_rgb(240, 90, 90)));
-                    }
-                }
-                if let Some(i) = remove {
-                    list.remove(i);
-                    changed = true;
-                }
-                if ui.button(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "New GREP Style"))).clicked() {
-                    list.push(json!({"style": cnames.get(1).cloned().unwrap_or_default(), "pattern": "\\d+"}));
-                    changed = true;
-                }
-                if changed {
-                    d.fields.insert("p.grepStyles".into(), Value::Array(list));
-                }
-            }
+            "nested" => drop_caps_and_nested_styles(&app.ui.language, ui, d, &pv, &cnames),
+            "grep" => grep_styles(&app.ui.language, ui, d, &pv, &cnames),
             "chars" => basic_character_formats(app, ui, d, &CharFields { base: &cv, sparse: false }),
             "indents" => {
                 egui::Grid::new("psi").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
@@ -4167,31 +4038,36 @@ fn paragraph_style_options(app: &mut DesignApp, ui: &mut egui::Ui, d: &mut Dialo
                         }
                         ui.end_row();
                     }
+                    // The CJK Grid Settings section edits the same `p.gridAlign` field.
+                    use designcraft_doc::GridAlign;
+                    const GRID_ALIGN: [(GridAlign, &str); 3] =
+                        [(GridAlign::None, "None"), (GridAlign::AllLines, "All Lines"), (GridAlign::FirstLineOnly, "First Line Only")];
+                    crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, "Align to Grid:"));
+                    let g: GridAlign = serde_json::from_value(cur(d, "p.gridAlign", &pv["gridAlign"])).unwrap_or_default();
+                    let shown = GRID_ALIGN.iter().find(|o| o.0 == g).map_or("", |o| o.1);
+                    egui::ComboBox::from_id_salt("psgridalign")
+                        .selected_text(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, shown)))
+                        .width(240.0)
+                        .show_ui(ui, |ui| {
+                            for (v, label) in GRID_ALIGN {
+                                if ui.selectable_label(v == g, crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, label))).clicked()
+                                    && let Ok(v) = serde_json::to_value(v)
+                                {
+                                    d.fields.insert("p.gridAlign".into(), v);
+                                }
+                            }
+                        });
+                    ui.end_row();
                 });
+                ui.add_space(6.0);
+                let mut ignore = cur(d, "p.ignoreOpticalMargin", &pv["ignoreOpticalMargin"]).as_bool().unwrap_or(false);
+                if ui.checkbox(&mut ignore, crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Ignore Optical Margin"))).changed() {
+                    d.fields.insert("p.ignoreOpticalMargin".into(), json!(ignore));
+                }
             }
             "tabs" => style_tabs(&app.ui.language, ui, d, &pv, &doc),
             "rules" => paragraph_rules(app, ui, d, "p.", &pv),
-            "hyph" => {
-                let mut h = cur(d, "p.hyphenate", &pv["hyphenate"]).as_bool().unwrap_or(true);
-                if ui.checkbox(&mut h, crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Hyphenate"))).changed() {
-                    d.fields.insert("p.hyphenate".into(), json!(h));
-                }
-                egui::Grid::new("psh").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                    for (label, key) in [
-                        ("Words with at Least:", "hyphMinWord"),
-                        ("After First:", "hyphAfterFirst"),
-                        ("Before Last:", "hyphBeforeLast"),
-                        ("Hyphen Limit:", "hyphLimit"),
-                    ] {
-                        crate::rtl::label(ui, crate::i18n::tr(&app.ui.language, label));
-                        let v = cur(d, &format!("p.{key}"), &pv[key]).as_f64();
-                        if let Some(n) = crate::widgets::number(ui, &format!("ps{key}"), v, "", 60.0, 0) {
-                            d.fields.insert(format!("p.{key}"), json!(n.max(0.0) as u64));
-                        }
-                        ui.end_row();
-                    }
-                });
-            }
+            "hyph" => hyphenation(&app.ui.language, ui, d, "p.", &pv, units),
             "justify" => justification(&app.ui.language, ui, d, "p.", &pv),
             "color" => character_color(&app.ui.language, ui, d, &CharFields { base: &cv, sparse: false }, &doc),
             "advanced" => advanced_character_formats(&app.ui.language, ui, d, &CharFields { base: &cv, sparse: false }),
@@ -4687,6 +4563,254 @@ fn border_shading(lang: &str, ui: &mut egui::Ui, d: &mut Dialog, pv: &Value, doc
     });
 }
 
+/// Drop Caps and Nested Styles: the drop cap, nested styles and nested line styles (`p.` fields).
+fn drop_caps_and_nested_styles(lang: &str, ui: &mut egui::Ui, d: &mut Dialog, pv: &Value, cnames: &[String]) {
+    let cur = |d: &Dialog, k: &str, base: &Value| d.fields.get(k).cloned().unwrap_or_else(|| base.clone());
+    crate::rtl::label(ui, egui::RichText::new(crate::i18n::tr(lang, "Drop Caps")).font(semibold(12.0)));
+    egui::Grid::new("psdc").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+        for (label, key, max) in [
+            ("Lines:", "dropCapLines", designcraft_compose::MAX_DROP_CAP_LINES),
+            ("Characters:", "dropCapChars", designcraft_compose::MAX_DROP_CAP_CHARS),
+        ] {
+            crate::rtl::label(ui, crate::i18n::tr(lang, label));
+            let v = cur(d, &format!("p.{key}"), &pv[key]).as_f64();
+            if let Some(n) = crate::widgets::number(ui, &format!("ps{key}"), v, "", 60.0, 0) {
+                d.fields.insert(format!("p.{key}"), json!((n.max(0.0) as u64).min(max as u64)));
+            }
+            ui.end_row();
+        }
+        crate::rtl::label(ui, crate::i18n::tr(lang, "Character Style:"));
+        let style = cur(d, "p.dropCapStyle", &pv["dropCapStyle"]).as_str().unwrap_or("").to_string();
+        let style = if style.is_empty() { designcraft_doc::NO_CHAR_STYLE.to_string() } else { style };
+        egui::ComboBox::from_id_salt("ps_dropcap_style")
+            .selected_text(crate::rtl::widget(ui, crate::i18n::style_name(lang, &style)))
+            .width(160.0)
+            .show_ui(ui, |ui| {
+                for c in cnames {
+                    if ui.selectable_label(*c == style, crate::rtl::widget(ui, crate::i18n::style_name(lang, c))).clicked() {
+                        d.fields.insert("p.dropCapStyle".into(), json!(c));
+                    }
+                }
+            });
+        ui.end_row();
+    });
+    for (label, key) in [("Align Left Edge", "dropCapAlignLeft"), ("Scale for Descenders", "dropCapScaleDescenders")] {
+        let mut on = cur(d, &format!("p.{key}"), &pv[key]).as_bool().unwrap_or(false);
+        if ui.checkbox(&mut on, crate::rtl::widget(ui, crate::i18n::tr(lang, label))).changed() {
+            d.fields.insert(format!("p.{key}"), json!(on));
+        }
+    }
+    ui.add_space(8.0);
+    crate::rtl::label(ui, egui::RichText::new(crate::i18n::tr(lang, "Nested Styles")).font(semibold(12.0)));
+    let mut list: Vec<Value> = cur(d, "p.nestedStyles", &pv["nestedStyles"]).as_array().cloned().unwrap_or_default();
+    let mut changed = false;
+    let mut remove = None;
+    for (i, ns) in list.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            let style = ns["style"].as_str().unwrap_or("[None]").to_string();
+            egui::ComboBox::from_id_salt(("ns_style", i))
+                .selected_text(crate::rtl::widget(ui, crate::i18n::style_name(lang, &style)))
+                .width(110.0)
+                .show_ui(ui, |ui| {
+                    for c in cnames {
+                        if ui.selectable_label(*c == style, crate::rtl::widget(ui, crate::i18n::style_name(lang, c))).clicked() {
+                            ns["style"] = json!(c);
+                            changed = true;
+                        }
+                    }
+                });
+            let through = ns["through"].as_bool().unwrap_or(true);
+            egui::ComboBox::from_id_salt(("ns_thr", i))
+                .selected_text(crate::rtl::widget(ui, crate::i18n::tr(lang, if through { "through" } else { "up to" })))
+                .width(70.0)
+                .show_ui(ui, |ui| {
+                    for (v, l) in [(true, "through"), (false, "up to")] {
+                        if ui.selectable_label(v == through, crate::rtl::widget(ui, crate::i18n::tr(lang, l))).clicked() {
+                            ns["through"] = json!(v);
+                            changed = true;
+                        }
+                    }
+                });
+            let mut n = ns["count"].as_u64().unwrap_or(1) as u32;
+            let mut count_value = |ui: &mut egui::Ui, ns: &mut Value, changed: &mut bool| {
+                if ui.add(egui::DragValue::new(&mut n).range(1..=999)).changed() {
+                    ns["count"] = json!(n);
+                    *changed = true;
+                }
+            };
+            if !crate::i18n::category_first(lang) {
+                count_value(ui, ns, &mut changed);
+            }
+            let kind = ns["until"]["kind"].as_str().unwrap_or("words").to_string();
+            egui::ComboBox::from_id_salt(("ns_until", i))
+                .selected_text(crate::rtl::widget(
+                    ui,
+                    if crate::i18n::category_first(lang) {
+                        format!("{}:", crate::i18n::tr(lang, &kind))
+                    } else {
+                        crate::i18n::tr(lang, &kind).to_owned()
+                    },
+                ))
+                .width(100.0)
+                .show_ui(ui, |ui| {
+                    for k in
+                        ["sentences", "words", "characters", "letters", "digits", "tab", "forcedLineBreak", "emSpace", "enSpace", "dropcap", "chars"]
+                    {
+                        if ui.selectable_label(k == kind, crate::rtl::widget(ui, crate::i18n::tr(lang, k))).clicked() {
+                            ns["until"] = if k == "chars" { json!({"kind": "chars", "chars": ":"}) } else { json!({"kind": k}) };
+                            changed = true;
+                        }
+                    }
+                });
+            if crate::i18n::category_first(lang) {
+                count_value(ui, ns, &mut changed);
+            }
+            if kind == "chars" {
+                let mut c = ns["until"]["chars"].as_str().unwrap_or("").to_string();
+                if ui.add(egui::TextEdit::singleline(&mut c).desired_width(40.0)).changed() {
+                    ns["until"]["chars"] = json!(c);
+                    changed = true;
+                }
+            }
+            if ui
+                .small_button("×")
+                .on_hover_ui(|ui| {
+                    crate::rtl::label(ui, crate::i18n::tr(lang, "Delete"));
+                })
+                .clicked()
+            {
+                remove = Some(i);
+            }
+        });
+    }
+    if let Some(i) = remove {
+        list.remove(i);
+        changed = true;
+    }
+    if ui.button(crate::rtl::widget(ui, crate::i18n::tr(lang, "New Nested Style"))).clicked() {
+        list.push(json!({"style": cnames.get(1).cloned().unwrap_or_default(), "through": true, "count": 1, "until": {"kind": "words"}}));
+        changed = true;
+    }
+    if changed {
+        d.fields.insert("p.nestedStyles".into(), Value::Array(list));
+    }
+    ui.add_space(8.0);
+    crate::rtl::label(ui, egui::RichText::new(crate::i18n::tr(lang, "Nested Line Styles")).font(semibold(12.0)));
+    let mut lines: Vec<Value> = cur(d, "p.nestedLineStyles", &pv["nestedLineStyles"]).as_array().cloned().unwrap_or_default();
+    let mut changed = false;
+    let mut remove = None;
+    for (i, l) in lines.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            let style = l["style"].as_str().unwrap_or("").to_string();
+            egui::ComboBox::from_id_salt(("nls_style", i))
+                .selected_text(crate::rtl::widget(ui, crate::i18n::style_name(lang, &style)))
+                .width(130.0)
+                .show_ui(ui, |ui| {
+                    for c in cnames {
+                        if ui.selectable_label(*c == style, crate::rtl::widget(ui, crate::i18n::style_name(lang, c))).clicked() {
+                            l["style"] = json!(c);
+                            changed = true;
+                        }
+                    }
+                });
+            crate::rtl::label(
+                ui,
+                if crate::i18n::category_first(lang) {
+                    format!("{}:", crate::i18n::tr(lang, "lines"))
+                } else {
+                    crate::i18n::tr(lang, "for").to_owned()
+                },
+            );
+            let mut n = l["lines"].as_u64().unwrap_or(1) as u32;
+            if ui.add(egui::DragValue::new(&mut n).range(1..=999)).changed() {
+                l["lines"] = json!(n);
+                changed = true;
+            }
+            if !crate::i18n::category_first(lang) {
+                crate::rtl::label(ui, crate::i18n::tr(lang, if n == 1 { "line" } else { "lines" }));
+            }
+            if ui
+                .small_button("×")
+                .on_hover_ui(|ui| {
+                    crate::rtl::label(ui, crate::i18n::tr(lang, "Delete"));
+                })
+                .clicked()
+            {
+                remove = Some(i);
+            }
+        });
+    }
+    if let Some(i) = remove {
+        lines.remove(i);
+        changed = true;
+    }
+    if ui.button(crate::rtl::widget(ui, crate::i18n::tr(lang, "New Line Style"))).clicked() {
+        lines.push(json!({"style": cnames.get(1).cloned().unwrap_or_default(), "lines": 1}));
+        changed = true;
+    }
+    if changed {
+        d.fields.insert("p.nestedLineStyles".into(), Value::Array(lines));
+    }
+}
+
+/// GREP Styles: a character style applied to text matching each pattern (`p.` fields).
+fn grep_styles(lang: &str, ui: &mut egui::Ui, d: &mut Dialog, pv: &Value, cnames: &[String]) {
+    let cur = |d: &Dialog, k: &str, base: &Value| d.fields.get(k).cloned().unwrap_or_else(|| base.clone());
+    crate::rtl::label(ui, egui::RichText::new(crate::i18n::tr(lang, "GREP Styles")).font(semibold(12.0)));
+    let mut list: Vec<Value> = cur(d, "p.grepStyles", &pv["grepStyles"]).as_array().cloned().unwrap_or_default();
+    let mut changed = false;
+    let mut remove = None;
+    for (i, g) in list.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            crate::rtl::label(ui, crate::i18n::tr(lang, "Apply Style:"));
+            let style = g["style"].as_str().unwrap_or("").to_string();
+            egui::ComboBox::from_id_salt(("gs_style", i))
+                .selected_text(crate::rtl::widget(ui, crate::i18n::style_name(lang, &style)))
+                .width(110.0)
+                .show_ui(ui, |ui| {
+                    for c in cnames {
+                        if ui.selectable_label(*c == style, crate::rtl::widget(ui, crate::i18n::style_name(lang, c))).clicked() {
+                            g["style"] = json!(c);
+                            changed = true;
+                        }
+                    }
+                });
+            crate::rtl::label(ui, crate::i18n::tr(lang, "To Text:"));
+            let mut pat = g["pattern"].as_str().unwrap_or("").to_string();
+            let bad = grep_error(&pat).is_some();
+            let r =
+                ui.add(egui::TextEdit::singleline(&mut pat).desired_width(150.0).text_color_opt(bad.then_some(egui::Color32::from_rgb(240, 90, 90))));
+            if r.changed() {
+                g["pattern"] = json!(pat);
+                changed = true;
+            }
+            if ui
+                .small_button("×")
+                .on_hover_ui(|ui| {
+                    crate::rtl::label(ui, crate::i18n::tr(lang, "Delete"));
+                })
+                .clicked()
+            {
+                remove = Some(i);
+            }
+        });
+        if let Some(e) = grep_error(g["pattern"].as_str().unwrap_or("")) {
+            crate::rtl::label(ui, egui::RichText::new(e).size(11.0).color(egui::Color32::from_rgb(240, 90, 90)));
+        }
+    }
+    if let Some(i) = remove {
+        list.remove(i);
+        changed = true;
+    }
+    if ui.button(crate::rtl::widget(ui, crate::i18n::tr(lang, "New GREP Style"))).clicked() {
+        list.push(json!({"style": cnames.get(1).cloned().unwrap_or_default(), "pattern": "\\d+"}));
+        changed = true;
+    }
+    if changed {
+        d.fields.insert("p.grepStyles".into(), Value::Array(list));
+    }
+}
+
 /// Paragraph Style Options › Keep Options: lines kept with the next paragraph, the paragraph's
 /// lines kept together (all of them, or its first and last lines), and where it starts.
 fn keep_options(lang: &str, ui: &mut egui::Ui, d: &mut Dialog, pv: &Value) {
@@ -5096,6 +5220,15 @@ fn paragraph_local(app: &mut DesignApp, ui: &mut egui::Ui, d: &mut Dialog) {
     ui.set_min_width(480.0);
     match d.s("section").as_str() {
         "span" => span_columns(&lang, ui, d, &pv, &doc),
+        "keep" => keep_options(&lang, ui, d, &pv),
+        "nested" | "grep" => {
+            let cnames: Vec<String> = doc.styles.character.iter().map(|c| c.name.clone()).collect();
+            if d.s("section") == "nested" {
+                drop_caps_and_nested_styles(&lang, ui, d, &pv, &cnames);
+            } else {
+                grep_styles(&lang, ui, d, &pv, &cnames);
+            }
+        }
         "bullets" => {
             let (char_styles, families, fonts, scope) = ListUi::new_parts(app);
             let (family, style) = (d.s("family"), d.s("style"));
@@ -5147,7 +5280,7 @@ pub fn open_style_options(app: &mut DesignApp, para: bool, name: &str) {
         return;
     }
     let id = if para { "paragraphStyleOptions" } else { "characterStyleOptions" };
-    app.ui.dialog = Some(Dialog::new(id, json!({"name": name})));
+    app.ui.dialog = Some(Dialog::new(id, json!({"name": name, "preview": app.ui.style_preview})));
 }
 
 /// New Paragraph Style… / New Character Style…: the style options for a style made on OK, named
@@ -5157,6 +5290,57 @@ pub fn open_new_style(app: &mut DesignApp, para: bool) {
     let name = next_style_name(&st.doc.styles, para);
     let id = if para { "paragraphStyleOptions" } else { "characterStyleOptions" };
     app.ui.dialog = Some(Dialog::new(id, json!({"new": true, "rename": name})));
+}
+
+/// The General section of the Character Style Options dialog: name, Based On, and a summary of
+/// the style's settings.
+fn character_style_general(
+    lang: &str,
+    ui: &mut egui::Ui,
+    d: &mut Dialog,
+    styles: &designcraft_doc::Styles,
+    style: &designcraft_doc::CharacterStyle,
+    based: &str,
+) {
+    let (name, new) = (d.s("name"), d.b("new"));
+    egui::Grid::new("csg").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+        crate::rtl::label(ui, crate::i18n::tr(lang, "Style Name:"));
+        text_field(ui, d, "rename", 220.0);
+        ui.end_row();
+        crate::rtl::label(ui, crate::i18n::tr(lang, "Based On:"));
+        egui::ComboBox::from_id_salt("csbased").selected_text(crate::rtl::widget(ui, crate::i18n::style_name(lang, based))).width(220.0).show_ui(
+            ui,
+            |ui| {
+                // Not itself, nor a style based on it.
+                for s in styles.character.iter().filter(|s| new || !styles.char_based_on_cycles(&name, &s.name)) {
+                    if ui.selectable_label(s.name == based, crate::rtl::widget(ui, crate::i18n::style_name(lang, &s.name))).clicked() {
+                        d.fields.insert("basedOn".into(), json!(s.name));
+                    }
+                }
+            },
+        );
+        ui.end_row();
+    });
+    let status = d.s("status");
+    if !status.is_empty() {
+        crate::rtl::label(ui, egui::RichText::new(status).color(crate::theme::Tokens::get(ui.ctx()).text_strong));
+    }
+    ui.add_space(8.0);
+    crate::rtl::label(ui, egui::RichText::new(crate::i18n::tr(lang, "Style Settings:")).font(semibold(12.0)));
+    // What OK would leave the style setting, after its Based On.
+    let mut own = serde_json::to_value(&style.chars).unwrap_or_default();
+    if let Some(o) = own.as_object_mut() {
+        for (k, v) in d.fields.iter().filter_map(|(k, v)| Some((k.strip_prefix("c.")?, v))) {
+            if v.is_null() {
+                o.remove(k);
+            } else {
+                o.insert(k.to_string(), v.clone());
+            }
+        }
+    }
+    let mut parts = vec![crate::i18n::style_name(lang, based).to_string()];
+    parts.extend(own.as_object().into_iter().flatten().map(|(k, v)| format!("{}: {}", setting_label(lang, k), setting_text(v))));
+    ui.add(egui::Label::new(egui::RichText::new(parts.join(" + ")).color(crate::theme::Tokens::get(ui.ctx()).text_dim)).wrap());
 }
 
 /// Character Style Options: General, then the character sections it shares with Paragraph Style
@@ -5221,46 +5405,7 @@ fn character_style_options(app: &mut DesignApp, ui: &mut egui::Ui, d: &mut Dialo
             "underline" => line_options(&lang, ui, d, &cf, &doc, "underline"),
             "strikethrough" => line_options(&lang, ui, d, &cf, &doc, "strikethrough"),
             s if style_cjk::is_section(s) => style_cjk::section_ui(app, ui, d, s, &cf, None, &doc),
-            _ => {
-                egui::Grid::new("csg").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                    crate::rtl::label(ui, crate::i18n::tr(&lang, "Style Name:"));
-                    text_field(ui, d, "rename", 220.0);
-                    ui.end_row();
-                    crate::rtl::label(ui, crate::i18n::tr(&lang, "Based On:"));
-                    egui::ComboBox::from_id_salt("csbased")
-                        .selected_text(crate::rtl::widget(ui, crate::i18n::style_name(&lang, &based)))
-                        .width(220.0)
-                        .show_ui(ui, |ui| {
-                            // Not itself, nor a style based on it.
-                            for s in styles.character.iter().filter(|s| new || !styles.char_based_on_cycles(&name, &s.name)) {
-                                if ui.selectable_label(s.name == based, crate::rtl::widget(ui, crate::i18n::style_name(&lang, &s.name))).clicked() {
-                                    d.fields.insert("basedOn".into(), json!(s.name));
-                                }
-                            }
-                        });
-                    ui.end_row();
-                });
-                let status = d.s("status");
-                if !status.is_empty() {
-                    crate::rtl::label(ui, egui::RichText::new(status).color(crate::theme::Tokens::get(ui.ctx()).text_strong));
-                }
-                ui.add_space(8.0);
-                crate::rtl::label(ui, egui::RichText::new(crate::i18n::tr(&lang, "Style Settings:")).font(semibold(12.0)));
-                // What OK would leave the style setting, after its Based On.
-                let mut own = serde_json::to_value(&style.chars).unwrap_or_default();
-                if let Some(o) = own.as_object_mut() {
-                    for (k, v) in d.fields.iter().filter_map(|(k, v)| Some((k.strip_prefix("c.")?, v))) {
-                        if v.is_null() {
-                            o.remove(k);
-                        } else {
-                            o.insert(k.to_string(), v.clone());
-                        }
-                    }
-                }
-                let mut parts = vec![crate::i18n::style_name(&lang, &based).to_string()];
-                parts.extend(own.as_object().into_iter().flatten().map(|(k, v)| format!("{}: {}", setting_label(&lang, k), setting_text(v))));
-                ui.add(egui::Label::new(egui::RichText::new(parts.join(" + ")).color(crate::theme::Tokens::get(ui.ctx()).text_dim)).wrap());
-            }
+            _ => character_style_general(&lang, ui, d, styles, &style, &based),
         });
     });
 }
@@ -5780,6 +5925,158 @@ fn check_justification(d: &Dialog, prefix: &str, current: &Value) -> Result<(), 
     }
     Ok(())
 }
+
+/// Paragraph attributes the Hyphenation Settings dialog sets.
+pub const HYPH_ATTRS: [&str; 10] = [
+    "hyphenate",
+    "hyphMinWord",
+    "hyphAfterFirst",
+    "hyphBeforeLast",
+    "hyphLimit",
+    "hyphZone",
+    "hyphWeight",
+    "hyphCapitalized",
+    "hyphLastWord",
+    "hyphAcrossColumn",
+];
+
+/// InDesign's Hyphenation Settings: Hyphenate; Words with at Least, After First and Before Last
+/// (letters), Hyphen Limit (hyphens) and Hyphenation Zone; the Better Spacing ↔ Fewer Hyphens
+/// slider (0–10, as InDesign's HyphenWeight); Hyphenate Capitalized Words, Last Word and Across
+/// Column. Edited fields are stored as `{prefix}{key}`; the others show `current` (a mixed value
+/// is null and shows blank). The Hyphenation dialog for the selected paragraphs and Paragraph
+/// Style Options › Hyphenation both use it.
+fn hyphenation(lang: &str, ui: &mut egui::Ui, d: &mut Dialog, prefix: &str, current: &Value, units: Unit) {
+    let tr = |s: &str| crate::i18n::tr(lang, s).to_string();
+    let cur = |d: &Dialog, k: &str| d.fields.get(&format!("{prefix}{k}")).cloned().unwrap_or_else(|| current[k].clone());
+    // Labels right-aligned against their fields, as InDesign's.
+    let label_right = |ui: &mut egui::Ui, text: &str| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add(egui::Label::new(crate::rtl::widget(ui, text)).wrap_mode(egui::TextWrapMode::Extend))
+        });
+    };
+    let checkbox = |ui: &mut egui::Ui, d: &mut Dialog, key: &str, label: &str| {
+        let v = cur(d, key);
+        // Mixed shows indeterminate and starts off, so the first click turns it on for all.
+        let mut on = v.as_bool().unwrap_or(false);
+        if ui.add(egui::Checkbox::new(&mut on, crate::rtl::widget(ui, tr(label))).indeterminate(v.is_null())).changed() {
+            d.fields.insert(format!("{prefix}{key}"), json!(on));
+        }
+    };
+    checkbox(ui, d, "hyphenate", "Hyphenate");
+    ui.add_space(4.0);
+    egui::Grid::new(("hyph", prefix)).num_columns(3).spacing([8.0, 6.0]).show(ui, |ui| {
+        // InDesign's ranges.
+        for (label, key, unit, max) in [
+            ("Words with at Least:", "hyphMinWord", "letters", 25.0),
+            ("After First:", "hyphAfterFirst", "letters", 15.0),
+            ("Before Last:", "hyphBeforeLast", "letters", 15.0),
+            ("Hyphen Limit:", "hyphLimit", "hyphens", 25.0),
+        ] {
+            label_right(ui, &tr(label));
+            let min = if key == "hyphLimit" { 0.0 } else { 1.0 };
+            if let Some(n) = crate::widgets::spin_number(ui, &format!("hy{prefix}{key}"), cur(d, key).as_f64(), "", 60.0, 0) {
+                d.fields.insert(format!("{prefix}{key}"), json!(n.round().clamp(min, max) as u64));
+            }
+            crate::rtl::label(ui, tr(unit));
+            ui.end_row();
+        }
+        label_right(ui, &tr("Hyphenation Zone:"));
+        if let Some(n) = crate::widgets::spin_measure(ui, &format!("hy{prefix}zone"), cur(d, "hyphZone").as_f64(), units, 60.0) {
+            d.fields.insert(format!("{prefix}hyphZone"), json!(if n.is_finite() { n.clamp(0.0, 8640.0) } else { 36.0 }));
+        }
+        ui.end_row();
+    });
+    ui.add_space(6.0);
+    // Better Spacing ↔ Fewer Hyphens, in InDesign's eleven steps.
+    ui.horizontal(|ui| {
+        crate::rtl::label(ui, tr("Better Spacing"));
+        let w = cur(d, "hyphWeight").as_f64();
+        let mut step = w.map_or(5.0, |w| (w * 10.0).round()).clamp(0.0, 10.0);
+        // Mixed across the selection: the slider shows dimmed, and a click or drag on it, even
+        // one that leaves the knob in place, sets every paragraph to that step.
+        let mixed = w.is_none();
+        // The ticks go under the knob: their place in the paint order is taken first.
+        let ticks = ui.painter().add(egui::Shape::Noop);
+        let r = ui
+            .scope(|ui| {
+                ui.spacing_mut().slider_width = 180.0;
+                if mixed {
+                    ui.multiply_opacity(0.4);
+                }
+                ui.add(egui::Slider::new(&mut step, 0.0..=10.0).step_by(1.0).show_value(false).handle_shape(egui::style::HandleShape::Circle))
+            })
+            .inner;
+        // The tick marks under the track.
+        let t = crate::theme::Tokens::get(ui.ctx());
+        let inner = r.rect.shrink2(egui::vec2(r.rect.height() / 2.0, 0.0));
+        let y = r.rect.center().y;
+        let marks: Vec<egui::Shape> = (0..=10)
+            .map(|i| {
+                let x = inner.left() + inner.width() * i as f32 / 10.0;
+                egui::Shape::line_segment([egui::pos2(x, y - 8.0), egui::pos2(x, y + 8.0)], egui::Stroke::new(1.0, t.text_dim))
+            })
+            .collect();
+        ui.painter().set(ticks, egui::Shape::Vec(marks));
+        if r.changed() || (mixed && (r.clicked() || r.drag_stopped())) {
+            d.fields.insert(format!("{prefix}hyphWeight"), json!(step / 10.0));
+        }
+        crate::rtl::label(ui, tr("Fewer Hyphens"));
+    });
+    ui.add_space(6.0);
+    egui::Grid::new(("hyphc", prefix)).num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
+        checkbox(ui, d, "hyphCapitalized", "Hyphenate Capitalized Words");
+        checkbox(ui, d, "hyphLastWord", "Hyphenate Last Word");
+        ui.end_row();
+        checkbox(ui, d, "hyphAcrossColumn", "Hyphenate Across Column");
+        ui.end_row();
+    });
+}
+
+/// The Hyphenation dialog's edits, as `type.para` attrs.
+fn hyphenation_edits(d: &Dialog) -> Map<String, Value> {
+    HYPH_ATTRS.iter().filter_map(|k| d.fields.get(*k).map(|v| (k.to_string(), v.clone()))).collect()
+}
+
+/// Preview on: the edits show on the page (redone when a field changes) without an undo step;
+/// off, the paragraphs go back.
+fn hyphenation_preview(app: &mut DesignApp, d: &mut Dialog) {
+    let shown = d.fields.get(PREVIEWED).cloned();
+    if !d.b("preview") {
+        if shown.is_some() {
+            app.session.cancel_interaction();
+            d.fields.remove(PREVIEWED);
+        }
+        return;
+    }
+    let params = json!({"attrs": hyphenation_edits(d)});
+    if shown.as_ref() == Some(&params) || d.fields.get(PREVIEW_FAILED) == Some(&params) {
+        return;
+    }
+    if shown.is_none()
+        && let Err(e) = app.session.begin_interaction("Hyphenation")
+    {
+        d.fields.insert("status".into(), json!(e.to_string()));
+        return;
+    }
+    match app.session.preview("type.para", params.clone()) {
+        Ok(_) => {
+            d.fields.remove("status");
+            d.fields.remove(PREVIEW_FAILED);
+            d.fields.insert(PREVIEWED.into(), params);
+        }
+        // Rejected settings: the paragraphs go back, and the reason shows until they change.
+        Err(e) => {
+            app.session.cancel_interaction();
+            d.fields.remove(PREVIEWED);
+            d.fields.insert("status".into(), json!(e.to_string()));
+            d.fields.insert(PREVIEW_FAILED.into(), params);
+        }
+    }
+}
+
+/// The hyphenation settings a preview was refused for (not tried again until they change).
+const PREVIEW_FAILED: &str = "previewFailed";
 
 /// The Justification controls (the Justification dialog, and the Paragraph Style Options section).
 /// `current` holds the resolved paragraph attributes, `null` where the selected paragraphs differ
@@ -7576,6 +7873,35 @@ mod tests {
     }
 
     #[test]
+    fn paragraph_style_options_ignore_optical_margin_is_set_on_ok() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut app = DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({})).unwrap();
+        app.run("style.paragraph.create", json!({"name": "Flush"})).unwrap();
+        app.ui.dialog = Some(Dialog::new("paragraphStyleOptions", json!({"name": "Flush", "section": "indents"})));
+        let mut h = Harness::builder().with_size(egui::vec2(1000.0, 800.0)).build_ui_state(
+            |ui, app: &mut DesignApp| {
+                let key = egui::Id::new("ignore_optical_margin_fonts");
+                if ui.data(|d| d.get_temp::<bool>(key)).is_none() {
+                    crate::theme::install_fonts(ui.ctx(), "");
+                    ui.data_mut(|d| d.insert_temp(key, true));
+                    return;
+                }
+                show(app, ui.ctx());
+            },
+            app,
+        );
+        h.run_steps(3);
+        h.get_by_label("Ignore Optical Margin").click();
+        h.run_steps(3);
+        h.get_by_label("  OK  ").click();
+        h.run_steps(3);
+        let app = h.state();
+        assert!(app.ui.dialog.is_none());
+        assert_eq!(app.session.doc().unwrap().doc.styles.para("Flush").unwrap().para.ignore_optical_margin, Some(true));
+    }
+
+    #[test]
     fn paragraph_style_options_keep_a_bad_grep_pattern_open_with_the_error() {
         let (mut app, _) = ruled_paragraph();
         let ctx = egui::Context::default();
@@ -7604,6 +7930,146 @@ mod tests {
     fn para_attr(app: &mut DesignApp, story: &Value, at: usize, key: &str) -> Value {
         app.run("text.select", json!({"story": story, "anchor": at, "focus": at})).unwrap();
         app.run("type.selectionAttrs", json!({})).unwrap()["para"][key].clone()
+    }
+
+    /// The hyphenation video (Graphd Tutorials, 0:39–1:13): the Paragraph panel menu's
+    /// Hyphenation… opens InDesign's Hyphenation Settings for the selected paragraphs. Preview
+    /// shows the slider moved to Fewer Hyphens on the page without an undo step, OK makes it one
+    /// step on the selected paragraph only, and Cancel puts it back.
+    #[test]
+    fn hyphenation_settings_preview_apply_and_cancel_on_the_selected_paragraph() {
+        let (mut app, story) = two_paragraphs();
+        let ctx = dialog_context("en");
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+        let sid = designcraft_doc::StoryId(story.as_u64().unwrap());
+        let weight = |app: &DesignApp, para: usize| {
+            let d = &app.session.doc().unwrap().doc;
+            d.styles.resolve_para(&d.story(sid).unwrap().paras[para]).0.hyph_weight
+        };
+        assert!(crate::menus::menu_enabled(&app, "app.hyphenationDialog"));
+        app.run("app.hyphenationDialog", json!({})).unwrap();
+        for _ in 0..3 {
+            dialog_frame(&mut app, &ctx, screen, vec![]);
+        }
+        let labels = dialog_frame(&mut app, &ctx, screen, vec![]);
+        let d = app.ui.dialog.clone().unwrap();
+        assert_eq!(
+            (d.id.as_str(), d.fields["current"]["hyphWeight"].as_f64(), d.fields["current"]["hyphenate"].as_bool()),
+            ("hyphenation", Some(0.5), Some(true))
+        );
+        for label in [
+            "Hyphenation Settings",
+            "Hyphenate",
+            "Words with at Least:",
+            "letters",
+            "Hyphen Limit:",
+            "hyphens",
+            "Hyphenation Zone:",
+            "Better Spacing",
+            "Fewer Hyphens",
+            "Hyphenate Capitalized Words",
+            "Hyphenate Last Word",
+            "Hyphenate Across Column",
+            "Preview",
+        ] {
+            assert!(labels.iter().any(|(t, _, _)| t == label), "{label}: {labels:?}");
+        }
+        // Fewer Hyphens (9 of 10) with Preview: on the page, no undo step.
+        let before = undo_steps(&app);
+        let d = app.ui.dialog.as_mut().unwrap();
+        d.fields.insert("hyphWeight".into(), json!(0.9));
+        d.fields.insert("preview".into(), json!(true));
+        dialog_frame(&mut app, &ctx, screen, vec![]);
+        assert_eq!(weight(&app, 0), 0.9, "previewed");
+        assert_eq!(undo_steps(&app), before, "a preview is no step");
+        // Cancel: back as it was.
+        cancel(&mut app);
+        assert_eq!(weight(&app, 0), 0.5);
+        // Again, and OK: one step, the selected paragraph only.
+        app.run("app.hyphenationDialog", json!({})).unwrap();
+        let d = app.ui.dialog.as_mut().unwrap();
+        d.fields.insert("hyphWeight".into(), json!(0.9));
+        d.fields.insert("preview".into(), json!(true));
+        dialog_frame(&mut app, &ctx, screen, vec![]);
+        confirm(&mut app).unwrap();
+        assert_eq!((weight(&app, 0), weight(&app, 1)), (0.9, 0.5));
+        assert_eq!(undo_steps(&app), before + 1, "one undo step");
+        // Paragraph Style Options › Hyphenation has the same form.
+        app.ui.dialog = Some(Dialog::new("paragraphStyleOptions", json!({"name": designcraft_doc::story::BASIC_PARAGRAPH, "section": "hyph"})));
+        for _ in 0..3 {
+            dialog_frame(&mut app, &ctx, screen, vec![]);
+        }
+        let labels = dialog_frame(&mut app, &ctx, screen, vec![]);
+        for label in ["Hyphenation Zone:", "Better Spacing", "Fewer Hyphens", "Hyphenate Last Word", "Hyphenate Across Column"] {
+            assert!(labels.iter().any(|(t, _, _)| t == label), "style options: {label}");
+        }
+        app.ui.dialog = None;
+        app.run("edit.deselectAll", json!({})).unwrap();
+        assert!(!crate::menus::menu_enabled(&app, "app.hyphenationDialog"), "no paragraph");
+    }
+
+    /// Hyphenate differs across the selection: it shows mixed, and the first click turns it on for
+    /// all. Settings the command refuses show why: a preview goes back and isn't retried until they
+    /// change, and OK keeps the dialog open.
+    /// A mixed Better Spacing ↔ Fewer Hyphens slider: a click on its middle step sets every
+    /// selected paragraph to it, though the knob already sat there.
+    #[test]
+    fn hyphenation_settings_mixed_slider_click_sets_the_step() {
+        let (mut app, story) = two_paragraphs();
+        let ctx = dialog_context("en");
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+        app.run("type.para", json!({"attrs": {"hyphWeight": 0.2}})).unwrap();
+        app.run("text.select", json!({"story": story, "anchor": 0, "focus": 7})).unwrap();
+        app.run("app.hyphenationDialog", json!({})).unwrap();
+        for _ in 0..3 {
+            dialog_frame(&mut app, &ctx, screen, vec![]);
+        }
+        let labels = dialog_frame(&mut app, &ctx, screen, vec![]);
+        let rect = |l: &str| labels.iter().find(|(t, _, _)| t == l).map(|(_, r, _)| *r).unwrap();
+        let (better, fewer) = (rect("Better Spacing"), rect("Fewer Hyphens"));
+        click_dialog(&mut app, &ctx, screen, egui::pos2((better.right() + fewer.left()) / 2.0, better.center().y));
+        assert_eq!(app.ui.dialog.as_ref().unwrap().fields.get("hyphWeight"), Some(&json!(0.5)));
+    }
+
+    #[test]
+    fn hyphenation_settings_mixed_checkbox_and_refused_settings() {
+        let (mut app, story) = two_paragraphs();
+        let ctx = dialog_context("en");
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+        app.run("type.para", json!({"attrs": {"hyphenate": false}})).unwrap();
+        app.run("text.select", json!({"story": story, "anchor": 0, "focus": 7})).unwrap();
+        app.run("app.hyphenationDialog", json!({})).unwrap();
+        assert!(app.ui.dialog.as_ref().unwrap().fields["current"]["hyphenate"].is_null(), "mixed");
+        for _ in 0..3 {
+            dialog_frame(&mut app, &ctx, screen, vec![]);
+        }
+        let labels = dialog_frame(&mut app, &ctx, screen, vec![]);
+        let at = labels.iter().find(|(t, _, _)| t == "Hyphenate").map(|(_, r, _)| r.left_center() - egui::vec2(10.0, 0.0)).unwrap();
+        click_dialog(&mut app, &ctx, screen, at);
+        assert_eq!(app.ui.dialog.as_ref().unwrap().fields.get("hyphenate"), Some(&json!(true)), "the first click turns it on");
+        // A refused setting (as a control-channel caller could send it): no preview, the reason.
+        let before = undo_steps(&app);
+        let d = app.ui.dialog.as_mut().unwrap();
+        d.fields.insert("hyphWeight".into(), json!("heavy"));
+        d.fields.insert("preview".into(), json!(true));
+        dialog_frame(&mut app, &ctx, screen, vec![]);
+        let d = app.ui.dialog.as_ref().unwrap();
+        assert!(!d.fields.contains_key(PREVIEWED) && d.fields.contains_key("status"), "{:?}", d.fields);
+        assert!(app.session.doc().unwrap().interaction.is_none(), "the preview went back");
+        dialog_frame(&mut app, &ctx, screen, vec![]);
+        assert!(app.session.doc().unwrap().interaction.is_none(), "not tried again");
+        // OK with it: an error, and the dialog stays open with the reason.
+        assert!(confirm(&mut app).is_err());
+        let d = app.ui.dialog.as_ref().expect("the dialog stays open");
+        assert!(d.fields.contains_key("status"));
+        assert_eq!(undo_steps(&app), before);
+        // Corrected, it previews and applies.
+        app.ui.dialog.as_mut().unwrap().fields.insert("hyphWeight".into(), json!(0.9));
+        dialog_frame(&mut app, &ctx, screen, vec![]);
+        assert!(!app.ui.dialog.as_ref().unwrap().fields.contains_key("status"));
+        confirm(&mut app).unwrap();
+        assert_eq!(para_attr(&mut app, &story, 0, "hyphenate"), true);
+        assert_eq!(para_attr(&mut app, &story, 4, "hyphWeight"), 0.9);
     }
 
     #[test]
@@ -7764,6 +8230,33 @@ mod tests {
     }
 
     #[test]
+    fn style_options_preview_choice_is_remembered_on_reopen() {
+        use egui_kittest::{Harness, kittest::Queryable};
+        let mut app = DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({})).unwrap();
+        app.run("style.paragraph.create", json!({"name":"Tutorial","chars":{"size":10}})).unwrap();
+        open_style_options(&mut app, true, "Tutorial");
+        let mut h = Harness::builder().with_size(egui::vec2(1000.0, 800.0)).build_ui_state(
+            |ui, app: &mut DesignApp| {
+                let key = egui::Id::new("style_preview_remember_fonts");
+                if ui.data(|d| d.get_temp::<bool>(key)).is_none() {
+                    crate::theme::install_fonts(ui.ctx(), "");
+                    ui.data_mut(|d| d.insert_temp(key, true));
+                    return;
+                }
+                show(app, ui.ctx());
+            },
+            app,
+        );
+        h.run_steps(3);
+        h.get_by_label("Preview").click();
+        h.run_steps(3);
+        cancel(h.state_mut());
+        open_style_options(h.state_mut(), true, "Tutorial");
+        assert!(h.state().ui.dialog.as_ref().unwrap().b("preview"), "Preview stays checked on reopen");
+    }
+
+    #[test]
     fn style_options_preview_updates_all_uses_cancels_and_commits_once() {
         use egui_kittest::{Harness, kittest::Queryable};
         for paragraph in [true, false] {
@@ -7919,6 +8412,35 @@ mod tests {
         app.ui.dialog = Some(d);
         confirm(&mut app).unwrap();
         assert_eq!((opts(&app).columns_kind, opts(&app).column_width), (designcraft_doc::ColumnsKind::FixedNumber, 120.0));
+    }
+
+    #[test]
+    fn text_frame_options_set_a_custom_baseline_grid_relative_to() {
+        use designcraft_doc::{FrameBaselineGrid, FrameGridRelative};
+        let mut app = crate::DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({})).unwrap();
+        let r = app.run("frame.create", json!({"rect": [36, 36, 336, 236], "content": "text", "text": "Hello"})).unwrap();
+        let id = designcraft_doc::ItemId(r["id"].as_u64().unwrap());
+        let grid = |app: &DesignApp| app.session.doc().unwrap().doc.item(id).unwrap().text_frame().unwrap().options.baseline_grid;
+        let open = |app: &mut DesignApp, fields: &[(&str, Value)]| {
+            let mut d = Dialog::new("textFrameOptions", json!({}));
+            seed_text_frame_options(app, &mut d);
+            for (k, v) in fields {
+                d.fields.insert((*k).into(), v.clone());
+            }
+            app.ui.dialog = Some(d);
+            confirm(app)
+        };
+        app.run("selection.set", json!({"ids": [id.0]})).unwrap();
+        // Turned on, the grid takes the shown start and increment (the document grid's: 3p0 and 1p0).
+        open(&mut app, &[("customGrid", json!(true)), ("gridRelativeTo", json!("frame"))]).unwrap();
+        assert_eq!(grid(&app), Some(FrameBaselineGrid { start: 36.0, increment: 12.0, relative_to: FrameGridRelative::TopOfFrame }));
+        // The dialog shows the frame's grid; changing Relative To keeps its start and increment.
+        open(&mut app, &[("gridStart", json!("0p10"))]).unwrap();
+        open(&mut app, &[("gridRelativeTo", json!("inset"))]).unwrap();
+        assert_eq!(grid(&app), Some(FrameBaselineGrid { start: 10.0, increment: 12.0, relative_to: FrameGridRelative::TopInset }));
+        open(&mut app, &[("customGrid", json!(false))]).unwrap();
+        assert_eq!(grid(&app), None);
     }
 
     #[test]
@@ -8956,7 +9478,7 @@ mod tests {
         assert_eq!(app.ui.language, "de");
         assert_eq!(app.ui.dialog.as_ref().map(|d| d.id.as_str()), Some("preferences"));
         let labels = dialog_frame(&mut app, &ctx, screen, vec![]);
-        let heading = visible_label(&labels, screen, "Sprache der Oberfläche");
+        let heading = visible_label(&labels, screen, crate::i18n::tr("de", "Interface Language"));
         let combo = visible_label(&labels, screen, "Deutsch");
 
         // The names stay endonyms in the German interface.
@@ -9095,7 +9617,11 @@ mod tests {
             for _ in 0..3 {
                 dialog_frame(&mut app, &ctx, screen, vec![]);
             }
-            let height = visible_label(&dialog_frame(&mut app, &ctx, screen, vec![]), screen, "66p1");
+            // With craft-fonts' Noto Sans Arabic the rows above are taller, so at the smallest size the
+            // Height field starts partly below the body's clip: scroll to it like the other fields.
+            let labels = dialog_frame(&mut app, &ctx, screen, vec![]);
+            let (_, _, body) = labels.iter().find(|(text, _, _)| text.trim() == "66p1").expect("66p1 is painted");
+            let height = scroll_to_label(&mut app, &ctx, screen, body.center(), "66p1");
             click_dialog(&mut app, &ctx, screen, height.center());
             dialog_frame(
                 &mut app,
@@ -9270,6 +9796,31 @@ mod tests {
         confirm(&mut app).expect("OK saves the style edit");
         let st = app.session.active().unwrap();
         assert_eq!(st.doc.styles.para(&name).unwrap().para.align, Some(designcraft_doc::Align::Center));
+    }
+
+    #[test]
+    fn paragraph_style_options_align_to_grid_shows_and_sets_the_style_grid_alignment() {
+        use designcraft_doc::GridAlign;
+        use egui_kittest::kittest::Queryable;
+        let mut app = test_app();
+        app.session.execute("style.paragraph.create", &json!({"name": "Grid Body", "para": {"gridAlign": "firstLineOnly"}})).unwrap();
+        app.ui.dialog = Some(Dialog::new("paragraphStyleOptions", json!({"name": "Grid Body", "section": "indents"})));
+        let mut h = crate::test_window::open(app, egui::vec2(1400.0, 900.0));
+        let grid = |h: &egui_kittest::Harness<'static, crate::test_window::Window>| {
+            h.state().app.session.active().unwrap().doc.styles.para("Grid Body").unwrap().para.grid_align
+        };
+        h.run_steps(4);
+        h.get_by_value("First Line Only");
+        confirm(&mut h.state_mut().app).unwrap();
+        assert_eq!(grid(&h), Some(GridAlign::FirstLineOnly), "OK without edits keeps the style's alignment");
+        h.state_mut().app.ui.dialog = Some(Dialog::new("paragraphStyleOptions", json!({"name": "Grid Body", "section": "indents"})));
+        h.run_steps(4);
+        h.get_by_value("First Line Only").click();
+        h.run_steps(3);
+        h.get_by_label("All Lines").click();
+        h.run_steps(3);
+        confirm(&mut h.state_mut().app).unwrap();
+        assert_eq!(grid(&h), Some(GridAlign::AllLines));
     }
 
     #[test]
