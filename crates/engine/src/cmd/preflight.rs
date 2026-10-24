@@ -354,11 +354,15 @@ mod placed_vector_tests {
         s.execute("file.place", &json!({"base64": base64_encode(&png), "name": "photo.jpg", "x": 72, "y": 72, "width": 20})).unwrap();
         let doc = std::sync::Arc::make_mut(&mut s.doc_mut().unwrap().doc);
         let asset = doc.assets.values_mut().next().unwrap();
-        std::sync::Arc::make_mut(asset).link = Some("/definitely/missing dir/photo.jpg".into());
+        // The temporary folder is an absolute path with the default settings on Windows, macOS and Linux. On Windows,
+        // `/x` names no drive, so `document_path` refuses it when the document has no path.
+        let link = std::env::temp_dir().join(format!("dc-preflight-missing-{} dir", std::process::id())).join("photo.jpg");
+        let link = link.to_string_lossy().into_owned();
+        std::sync::Arc::make_mut(asset).link = Some(link.clone());
         let r = s.execute("preflight.run", &json!({})).unwrap();
         let missing: Vec<&str> =
             r["issues"].as_array().unwrap().iter().filter(|i| i["kind"] == "missingLink").map(|i| i["message"].as_str().unwrap()).collect();
-        assert_eq!(missing, ["Missing link: /definitely/missing dir/photo.jpg"]);
+        assert_eq!(missing, [format!("Missing link: {link}")]);
     }
 }
 

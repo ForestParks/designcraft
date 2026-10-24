@@ -173,7 +173,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let inside = temp.path().join("allowed");
         std::fs::create_dir(&inside).unwrap();
-        let roots = AutomationRoots::new(Some(&inside), Some(&inside)).unwrap().unwrap();
+        let roots = AutomationRoots::new(&[&inside], &[&inside]).unwrap().unwrap();
         let mut app = crate::DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
         app.run("file.new", json!({"pages":1})).unwrap();
         let writer: crate::BackgroundWriteFn = Arc::new(|_, _| panic!("a refused output must never reach the host writer"));
@@ -198,6 +198,63 @@ mod tests {
         assert!(!app.pdf_export.busy());
         assert!(app.pdf_export.last.as_ref().unwrap()["error"].as_str().unwrap().contains("outside the write root"));
         assert!(!temp.path().join("outside.pdf").exists());
+    }
+
+    #[test]
+    fn background_export_preserves_multiple_roots_for_native_and_deferred_writes() {
+        use designcraft_engine::file_access::{AutomationRoots, check_write, confine};
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        let read_only = temp.path().join("read-only");
+        for dir in [&first, &second, &read_only] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let roots = AutomationRoots::new(&[&first, &read_only], &[&first, &second]).unwrap().unwrap();
+        for native in [false, true] {
+            let mut app = crate::DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
+            app.run("file.new", json!({"pages":1})).unwrap();
+            let forbidden = temp.path().join("not-granted.pdf");
+            let deferred_forbidden = forbidden.clone();
+            app.services.write = Some(Box::new(move |path, bytes| {
+                assert!(check_write(&deferred_forbidden).is_err(), "the deferred host writer must retain the caller's roots");
+                designcraft_engine::io::write_file(path, bytes)
+            }));
+            let background: crate::BackgroundWriteFn = Arc::new(move |path, bytes| {
+                assert!(check_write(&forbidden).is_err(), "the native host writer must retain the caller's roots");
+                designcraft_engine::io::write_file(path, bytes)
+            });
+            let ctx = egui::Context::default();
+            for (folder, allowed) in [(first.as_path(), true), (second.as_path(), true), (read_only.as_path(), false), (temp.path(), false)] {
+                let path = folder.join(if native { "native.pdf" } else { "deferred.pdf" });
+                confine(Some(&roots), || {
+                    app.pdf_export
+                        .start(
+                            app.session.active().unwrap(),
+                            app.session.cache.clone(),
+                            path.to_string_lossy().into_owned(),
+                            json!({}),
+                            ctx.clone(),
+                            native.then(|| background.clone()),
+                        )
+                        .unwrap();
+                });
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while app.pdf_export.busy() && std::time::Instant::now() < deadline {
+                    app.logic(&ctx);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                assert!(!app.pdf_export.busy());
+                let result = app.pdf_export.last.as_ref().unwrap();
+                if allowed {
+                    assert!(result.get("error").is_none(), "{result}");
+                    assert!(std::fs::read(&path).unwrap().starts_with(b"%PDF"));
+                } else {
+                    assert!(result["error"].as_str().unwrap().contains("outside the write roots"), "{result}");
+                    assert!(!path.exists());
+                }
+            }
+        }
     }
 
     #[test]

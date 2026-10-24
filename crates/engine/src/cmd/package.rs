@@ -135,8 +135,9 @@ impl OutputRoot {
         {
             use std::os::unix::fs::PermissionsExt;
 
-            // Match fs::write for a new output: 0666 restricted by the caller's umask.
-            builder.permissions(std::fs::Permissions::from_mode(0o666));
+            // Like fs::write for a new output: request 0666 and let the process umask decide the
+            // effective mode (0644 with the usual 022, 0664 with 002).
+            builder.permissions(std::fs::Permissions::from_mode(0o666)); // NOSONAR
         }
         let file = builder.tempfile_in(parent).map_err(|e| path_error(path, e))?;
         #[cfg(unix)]
@@ -906,13 +907,12 @@ mod tests {
         let outside = base.join("separate");
         std::fs::create_dir_all(&outside).unwrap();
         let redirected = base.join("Package");
-        match symlink_dir(&outside, &redirected) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                let _ = std::fs::remove_dir_all(&base);
-                return;
-            }
-            Err(e) => panic!("could not create directory redirect: {e}"),
+        // A symbolic link needs Developer Mode or elevation (os error 1314 without them); a
+        // directory junction needs neither, and `is_redirect` treats both as redirects.
+        if symlink_dir(&outside, &redirected).is_err() && !make_junction(&outside, &redirected) {
+            eprintln!("skipped: directory redirects can't be made here");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
         }
         let mut s = Session::new();
         s.execute("file.new", &json!({"title": "Annual"})).unwrap();
@@ -920,5 +920,18 @@ mod tests {
         assert!(!outside.join("Annual.designcraft").exists());
         std::fs::remove_dir(&redirected).unwrap();
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Makes `link` a directory junction to `target` with `mklink /J`, and reports whether it was made.
+    #[cfg(windows)]
+    fn make_junction(target: &Path, link: &Path) -> bool {
+        use std::os::windows::process::CommandExt;
+
+        // Windows paths can't hold `"`, so quoting each one keeps `&` and spaces in it literal for cmd.
+        std::process::Command::new("cmd")
+            .args(["/D", "/C"])
+            .raw_arg(format!("mklink /J \"{}\" \"{}\"", link.display(), target.display()))
+            .output()
+            .is_ok_and(|output| output.status.success())
     }
 }
