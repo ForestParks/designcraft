@@ -52,7 +52,12 @@ Package collects available originals in `Links/`; its native document retains th
 storage mode. PDF and print output use the loaded full-resolution artwork. This option reduces
 working-file storage and serialization. Encoded originals remain resident for reliable export,
 undo and recovery. External artwork reads are limited to 512 MiB
-per source file; use embedded storage for larger sources. EPS retains the existing preview
+per source file; use embedded storage for larger sources. Automatic opening also limits the
+combined original buffers to 4 GiB (counting existing shared buffers once) and attempts at most
+4,096 sources. Repeated placements of a loaded source share its buffer. Over-budget links stay
+unresolved with warnings; use Relink or Update for individual sources, or embedded storage.
+Warning details are capped at 32 plus an omitted-count summary; the Links panel shows all links.
+These limits cover encoded originals, not decoded rendering memory. EPS retains the existing preview
 rendering behavior; this change does not add a PostScript interpreter.
 
 Recovery, clipboard/snippets and `file.serialize` remain self-contained. Byte-only opening
