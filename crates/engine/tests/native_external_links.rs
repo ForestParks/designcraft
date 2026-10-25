@@ -92,7 +92,7 @@ fn linked_save_is_small_reopens_and_exports_the_same_pdf() {
     assert_eq!(assets(&linked), 0);
     assert!(std::fs::metadata(&linked).unwrap().len() < std::fs::metadata(&embedded).unwrap().len());
     assert_eq!(archive(&embedded).2, 2, "ordinary documents still open in older readers");
-    assert_eq!(archive(&linked).2, 4, "older readers must reject external native artwork");
+    assert_eq!(archive(&linked).2, 5, "version 4 readers cannot hydrate omitted external artwork");
     let mut reopened = Session::new();
     let opened = reopened.execute("file.open", &json!({"path": linked})).unwrap();
     assert_eq!(opened["warnings"], json!([]));
@@ -421,7 +421,7 @@ fn external_eps_retains_originals_on_reopen_and_migrates_legacy_preview_metadata
         }
         let path = temp.path().join(format!("linked-{legacy_preview}.designcraft"));
         session.execute("file.saveAs", &json!({"path": path, "embedImages": false})).unwrap();
-        assert_eq!(archive(&path).2, 4);
+        assert_eq!(archive(&path).2, 5, "linked EPS originals require the external-artwork reader");
         assert_eq!(assets(&path), 0);
         let mut reopened = Session::new();
         let result = reopened.execute("file.open", &json!({"path": path})).unwrap();

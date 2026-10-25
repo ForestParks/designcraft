@@ -122,7 +122,7 @@ up to 30 points.
 
 | Date | Change | Summary |
 |---|---|---|
-| 2026-10-20 | minor | Linked-only native working saves and legacy baseline compatibility (#856); only archives omitting linked originals need format 4, portable saves retain embedded compatibility, and distinct PDF crop boxes stay separate during compaction |
+| 2026-10-20 | minor | Linked-only native working saves and legacy baseline compatibility (#856); archives omitting linked originals need format 5 after integrating upstream format 4 layer capabilities, portable saves retain embedded compatibility, and distinct PDF crop boxes stay separate during compaction |
 | 2026-10-19 | minor | PDF/X-4 export and `validate-pdf` report visible unembedded fonts by name and page, including placed forms; invisible text is exempt, operation- or depth-limited checks report incompleteness, and automatic font repair remains missing (#909) |
 | 2026-10-15 | minor | IDML retains liquid versus ruler guide types on document and parent pages, with literal XML and mixed-guide round-trip coverage; object liquid constraints remain unsupported (#872) |
 | 2026-10-13 | minor | Asset loading and compaction use content fingerprints with exact equality checks; tests cover equal-sized distinct buffers, shared copies, independent links and missing data (#727) |

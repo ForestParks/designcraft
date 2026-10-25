@@ -682,6 +682,9 @@ impl<'r> Importer<'r> {
         if let Some(e) = top.iter().find(|e| e.local() == "FootnoteOption") {
             self.footnote_option(e);
         }
+        if let Some(e) = top.iter().find(|e| e.local() == "EPubExportPreference") {
+            self.epub_split(e);
+        }
         for e in top.iter().filter(|e| e.local() == "Layer") {
             let id = LayerId(self.alloc());
             let color = match e.prop_el("LayerColor") {
@@ -1187,6 +1190,14 @@ impl<'r> Importer<'r> {
                 Some(slot) => *slot = s,
                 None => self.styles.paragraph.push(s),
             }
+            // Split Document (EPUB only): on the style, and on its EPUB export tag map. Files write
+            // `false` on every style, so either place saying `true` turns it on.
+            let split = e.get("SplitDocument") == Some("true")
+                || e.elements()
+                    .any(|m| m.local() == "StyleExportTagMap" && m.get("ExportType") == Some("EPUB") && m.get("SplitDocument") == Some("true"));
+            if split {
+                self.styles.export_tags.entry(format!("p:{name}")).or_default().split = true;
+            }
         }
         for (_, e) in &chars {
             let name = names::style_name_in(CHAR_BUILTINS, e.get("Name").unwrap_or(""));
@@ -1459,6 +1470,21 @@ impl<'r> Importer<'r> {
             Some(f) => f.definition = def,
             None => self.xref_formats.push(designcraft_doc::XrefFormat { name, definition: def }),
         }
+    }
+
+    /// Preferences › `EPubExportPreference`: Split Document (after styles: it can name one). An
+    /// empty style name splits on the styles' export tags; a style the file lacks splits nothing.
+    fn epub_split(&mut self, e: &El) {
+        if e.boolean("BreakDocument") != Some(true) {
+            return;
+        }
+        let name = e.get("ParagraphStyleName").unwrap_or("$ID/NormalParagraphStyle");
+        self.settings.epub_split = if name.trim().is_empty() {
+            designcraft_doc::EpubSplit::ExportTags
+        } else {
+            let style = self.para_style_ref(name);
+            if self.styles.para(&style).is_some() { designcraft_doc::EpubSplit::Style(style) } else { designcraft_doc::EpubSplit::Off }
+        };
     }
 
     /// Preferences › `FootnoteOption` (after styles: it names the footnote text and marker styles).
@@ -3056,6 +3082,26 @@ impl<'r> Importer<'r> {
     }
 
     fn graphic(&mut self, g: &El) -> Content {
+        let layer_options = g.find("GraphicLayerOption").map(|options| {
+            let attrs = |e: &El| e.attrs.iter().filter(|(key, _)| key != "Self").cloned().collect();
+            let mut out = designcraft_doc::GraphicLayerOptions { attributes: attrs(options), ..Default::default() };
+            let mut pending: Vec<_> = options.find_all("GraphicLayer").map(|e| (e, None)).collect();
+            pending.reverse();
+            while let Some((layer, parent)) = pending.pop() {
+                let index = out.layers.len();
+                out.layers.push(attrs(layer));
+                out.parents.push(parent);
+                let children: Vec<_> = layer.find_all("GraphicLayer").collect();
+                pending.extend(children.into_iter().rev().map(|e| (e, Some(index))));
+            }
+            if out.parents.iter().all(Option::is_none) {
+                out.parents.clear();
+            }
+            out
+        });
+        if layer_options.as_ref().is_some_and(designcraft_doc::GraphicLayerOptions::has_visibility_overrides) {
+            self.warnings.push(format!("graphic {}: {}", g.get("Self").unwrap_or("(unnamed)"), designcraft_doc::GRAPHIC_LAYER_RENDERING_WARNING));
+        }
         let gxf = parse_affine(g.get("ItemTransform"));
         let (l, t, r, b) = match g.prop_el("GraphicBounds") {
             Some(gb) => {
@@ -3072,6 +3118,7 @@ impl<'r> Importer<'r> {
         let uri = link.and_then(|k| k.get("LinkResourceURI")).map(uri_to_path);
         let graphic = |asset, size| {
             Content::Graphic(designcraft_doc::Graphic {
+                layer_options: layer_options.clone(),
                 asset,
                 size,
                 xf: gxf * Affine::translate((l, t)),

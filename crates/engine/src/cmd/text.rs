@@ -1033,7 +1033,24 @@ fn story_options(s: &mut Session, p: &Value) -> Result<Value> {
     if on.is_none() && size.is_none() {
         return Err(bad(CMD, "nothing to set: give opticalMargin or opticalMarginSize"));
     }
-    let stories = if p.get("story").is_some() || p.get("frame").is_some() {
+    let explicit = |key| p.get(key).filter(|v| !v.is_null());
+    let stories = if explicit("story").is_some() || explicit("frame").is_some() {
+        // Explicit targets must not silently fall back to the current selection.
+        let doc = &s.doc()?.doc;
+        for key in ["story", "frame"] {
+            if let Some(value) = explicit(key) {
+                let id = value.as_u64().ok_or_else(|| bad(CMD, format!("`{key}` must be an unsigned integer")))?;
+                let sid = if key == "story" {
+                    StoryId(id)
+                } else {
+                    let item = doc.item(ItemId(id)).ok_or_else(|| bad(CMD, format!("no such frame {id}")))?;
+                    item.text_frame().ok_or_else(|| bad(CMD, format!("frame {id} holds no text")))?.story
+                };
+                if doc.story(sid).is_none() {
+                    return Err(bad(CMD, format!("no such story {}", sid.0)));
+                }
+            }
+        }
         vec![story_of(s, p).ok_or_else(|| bad(CMD, "no such story"))?]
     } else {
         selected_stories(s)?
@@ -3358,6 +3375,68 @@ mod bidi_caret_tests {
 #[cfg(test)]
 mod story_options_tests {
     use super::*;
+
+    #[test]
+    fn malformed_explicit_story_targets_do_not_change_the_selection() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let r = s.execute("frame.create", &json!({"rect": [0, 0, 300, 200], "content": "text", "text": "Selected"})).unwrap();
+        let sid = StoryId(r["story"].as_u64().unwrap());
+        for target in ["story", "frame"] {
+            for invalid in [json!("invalid"), json!(-1), json!(1.5), json!(true), json!({}), json!([]), json!(999_999)] {
+                let mut params = json!({"opticalMargin": true});
+                params[target] = invalid;
+                assert!(s.execute("story.options", &params).is_err(), "{params}");
+                assert!(!story(&s, sid).on, "{params} changed the selected story");
+            }
+        }
+        // Selection fallback still works when neither explicit target is supplied.
+        s.execute("story.options", &json!({"opticalMargin": true})).unwrap();
+        assert!(story(&s, sid).on);
+        s.execute("story.options", &json!({"frame": r["id"], "opticalMargin": false})).unwrap();
+        assert!(!story(&s, sid).on);
+    }
+
+    #[test]
+    fn story_options_treat_null_targets_as_absent_and_validate_both_explicit_ids() {
+        let mut s = Session::new();
+        s.execute("file.new", &json!({})).unwrap();
+        let a = s.execute("frame.create", &json!({"rect": [0, 0, 300, 200], "content": "text", "text": "Explicit"})).unwrap();
+        let b = s.execute("frame.create", &json!({"rect": [0, 300, 300, 500], "content": "text", "text": "Selected"})).unwrap();
+        let aid = StoryId(a["story"].as_u64().unwrap());
+        let bid = StoryId(b["story"].as_u64().unwrap());
+        for targets in [json!({"story": null}), json!({"frame": null}), json!({"story": null, "frame": null})] {
+            let mut p = targets;
+            p["opticalMargin"] = json!(true);
+            s.execute("story.options", &p).unwrap();
+            assert!(story(&s, bid).on);
+            assert!(!story(&s, aid).on);
+            s.execute("edit.undo", &json!({})).unwrap();
+            assert!(!story(&s, bid).on);
+        }
+        for targets in [json!({"story": null, "frame": a["id"]}), json!({"story": a["story"], "frame": null})] {
+            let mut p = targets;
+            p["opticalMargin"] = json!(true);
+            s.execute("story.options", &p).unwrap();
+            assert!(story(&s, aid).on);
+            assert!(!story(&s, bid).on);
+            s.execute("edit.undo", &json!({})).unwrap();
+        }
+        // Even a frame ignored by story precedence must be valid when explicitly supplied.
+        let non_text = s.execute("frame.create", &json!({"rect": [400, 0, 500, 100]})).unwrap();
+        for (targets, message) in [
+            (json!({"frame": 999_999}), "no such frame 999999".to_string()),
+            (json!({"frame": non_text["id"]}), format!("frame {} holds no text", non_text["id"])),
+            (json!({"story": 999_999}), "no such story 999999".to_string()),
+            (json!({"story": a["story"], "frame": 999_999}), "no such frame 999999".to_string()),
+        ] {
+            let mut p = targets;
+            p["opticalMargin"] = json!(true);
+            assert!(s.execute("story.options", &p).unwrap_err().to_string().contains(&message), "{p}: expected {message}");
+            assert!(!story(&s, aid).on);
+            assert!(!story(&s, bid).on);
+        }
+    }
 
     fn first_x(s: &Session, sid: StoryId) -> f64 {
         let cs = s.cache.get(&s.doc().unwrap().doc, sid, None);

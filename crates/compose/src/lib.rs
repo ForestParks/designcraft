@@ -3430,9 +3430,20 @@ fn layout_line(
         let h = shape::hyphen_after(g);
         line.push(h);
     }
-    // Tabs: compute widths left to right.
     let measure = x1 - x0;
-    let mut x = 0.0;
+    // Optical margin alignment and hanging punctuation: the glyphs at the line's edges hang
+    // outside the measure. A tab at an edge hangs nothing.
+    let is_tab = |g: &Glyph| g.ch == '\t' || g.ch == story::RIGHT_INDENT_TAB;
+    let at_edge = |g: &&Glyph| is_tab(g) || (g.adv > 0.0 && !g.is_space());
+    let first = line.iter().find(at_edge);
+    let lastg = line.iter().rev().find(at_edge);
+    let hl = first.map_or(0.0, |g| breaker::hang_left(g, sp));
+    let optical_right = lastg.map_or(0.0, |g| breaker::hang_right(g, sp));
+    let cjk_right = lastg.map_or(0.0, |g| g.cjk_hang);
+    let regular_hang = pp.kinsoku_hang == designcraft_doc::cjk::KinsokuHang::Regular;
+    // Tabs: compute widths left to right. Tab stops stay where they are when the line hangs, so
+    // tabs are measured from the hung start, and a right indent tab reaches the hung end.
+    let mut x = -hl;
     let mut i = 0;
     let mut leaders: Vec<(usize, String)> = Vec::new();
     // The line's last tab and whether it is a left tab (only text after a left tab justifies).
@@ -3462,26 +3473,17 @@ fn layout_line(
                 leaders.push((i, t.leader.clone()));
             }
             let rest: f64 = line[i + 1..].iter().map(|g| g.adv).sum();
-            line[i].adv = (measure - x - rest).max(0.0);
+            let hr = if regular_hang { optical_right } else { optical_right.max(cjk_right) };
+            line[i].adv = (measure + hr - x - rest).max(0.0);
             last_tab = Some((i, false));
         }
         x += line[i].adv;
         i += 1;
     }
-    let has_tab = line.iter().any(|g| g.ch == '\t' || g.ch == story::RIGHT_INDENT_TAB);
-    // Optical margin alignment: the measure grows by the hang of the edge glyphs.
+    // The measure grows by the hang of the edge glyphs.
     let (mut x0, mut measure) = (x0, measure);
-    if (sp.optical || pp.kinsoku_hang != designcraft_doc::cjk::KinsokuHang::None) && !has_tab {
-        let first = line.iter().find(|g| g.adv > 0.0 && !g.is_space());
-        let lastg = line.iter().rev().find(|g| g.adv > 0.0 && !g.is_space());
-        let hl = first.map_or(0.0, |g| breaker::hang_left(g, sp));
-        let optical_right = lastg.map_or(0.0, |g| breaker::hang_right(g, sp));
-        let cjk_right = lastg.map_or(0.0, |g| g.cjk_hang);
-        let cjk_right = if pp.kinsoku_hang == designcraft_doc::cjk::KinsokuHang::Regular {
-            cjk_right.min((line.iter().map(|g| g.adv).sum::<f64>() - measure).max(0.0))
-        } else {
-            cjk_right
-        };
+    if sp.optical || pp.kinsoku_hang != designcraft_doc::cjk::KinsokuHang::None {
+        let cjk_right = if regular_hang { cjk_right.min((line.iter().map(|g| g.adv).sum::<f64>() - measure).max(0.0)) } else { cjk_right };
         let hr = optical_right.max(cjk_right);
         x0 -= hl;
         measure += hl + hr;

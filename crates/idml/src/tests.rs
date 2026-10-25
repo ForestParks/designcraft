@@ -4507,6 +4507,7 @@ fn exports_graphic_in_table_cell() {
     });
     let mut t = designcraft_doc::Table::new(d.alloc(), 2, 2, 0, 0, 200.0);
     t.cell_mut(1, 0).unwrap().graphic = Some(designcraft_doc::Graphic {
+        layer_options: None,
         asset: id,
         size: (24.0, 24.0),
         xf: designcraft_geom::Affine::IDENTITY,
@@ -4629,5 +4630,59 @@ fn style_names_with_a_literal_colon_survive_a_round_trip() {
     assert_eq!(names::style_name_out(names::PARA_BUILTINS, "Group/Child"), "Group:Child");
     for n in names {
         assert_eq!(names::style_name_in(names::PARA_BUILTINS, &names::style_name_out(names::PARA_BUILTINS, n)), n);
+    }
+}
+
+/// Split Document (EPUB only) comes from the style, or from its EPUB export tag map, and is
+/// written back on the style.
+#[test]
+fn split_document_round_trips() {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<idPkg:Styles xmlns:idPkg="http://ns.adobe.com/AdobeInDesign/idml/1.0/packaging" DOMVersion="16.0">
+  <RootParagraphStyleGroup Self="rp">
+    <ParagraphStyle Self="ParagraphStyle/$ID/[No paragraph style]" Name="$ID/[No paragraph style]" PointSize="12" SplitDocument="false"/>
+    <ParagraphStyle Self="ParagraphStyle/Part" Name="Part" SplitDocument="true"/>
+    <ParagraphStyle Self="ParagraphStyle/Chapter" Name="Chapter" SplitDocument="false">
+      <StyleExportTagMap Self="uaStyleExportTagMapnEPUB" ExportType="EPUB" ExportTag="h1" ExportClass="" ExportAttributes="" SplitDocument="true" EmitCss="true"/>
+    </ParagraphStyle>
+    <ParagraphStyle Self="ParagraphStyle/Body" Name="Body" SplitDocument="false"/>
+  </RootParagraphStyleGroup>
+</idPkg:Styles>"#;
+    let d = import_idml_with(&fixture_with_styles(xml), &|_| None).unwrap();
+    let split = |d: &designcraft_doc::Document, name: &str| d.styles.export_tag(name, false).is_some_and(|t| t.split);
+    assert!(split(&d, "Part") && split(&d, "Chapter") && !split(&d, "Body"));
+    let back = import_idml(&export_idml(&d)).unwrap();
+    assert!(split(&back, "Part") && split(&back, "Chapter") && !split(&back, "Body"));
+}
+
+/// EPUB Export Options › Split Document: off, one style (built in or not) or the styles' export
+/// tags, read from the file's `EPubExportPreference` and written back.
+#[test]
+fn epub_split_document_round_trips() {
+    use designcraft_doc::EpubSplit;
+    let styles =
+        STYLES.replace("</RootParagraphStyleGroup>", r#"<ParagraphStyle Self="ParagraphStyle/Chapter" Name="Chapter"/></RootParagraphStyleGroup>"#);
+    assert!(styles.contains("ParagraphStyle/Chapter"), "the fixture has a paragraph style group");
+    for (attrs, want) in [
+        (r#"BreakDocument="false" ParagraphStyleName="ParagraphStyle/Chapter""#, EpubSplit::Off),
+        (r#"BreakDocument="true" ParagraphStyleName="ParagraphStyle/Chapter""#, EpubSplit::Style("Chapter".into())),
+        (r#"BreakDocument="true" ParagraphStyleName="ParagraphStyle/Text%3aBody""#, EpubSplit::Style("Text/Body".into())),
+        (r#"BreakDocument="true" ParagraphStyleName="$ID/NormalParagraphStyle""#, EpubSplit::Style(designcraft_doc::BASIC_PARAGRAPH.into())),
+        (r#"BreakDocument="true" ParagraphStyleName="""#, EpubSplit::ExportTags),
+        (r#"BreakDocument="true" ParagraphStyleName="ParagraphStyle/Missing""#, EpubSplit::Off),
+    ] {
+        let prefs = PREFS.replace("</idPkg:Preferences>", &format!("<EPubExportPreference {attrs}/></idPkg:Preferences>"));
+        let file = zip_files(&[
+            ("designmap.xml", DESIGNMAP),
+            ("Resources/Graphic.xml", GRAPHIC),
+            ("Resources/Styles.xml", &styles),
+            ("Resources/Preferences.xml", &prefs),
+            ("MasterSpreads/MasterSpread_m1.xml", MASTER),
+            ("Spreads/Spread_sp1.xml", SPREAD),
+            ("Stories/Story_s1.xml", STORY),
+        ]);
+        let d = import_idml_with(&file, &|_| None).unwrap();
+        assert_eq!(d.settings.epub_split, want, "{attrs}");
+        assert_eq!(import_idml(&export_idml(&d)).unwrap().settings.epub_split, want, "{attrs}");
     }
 }

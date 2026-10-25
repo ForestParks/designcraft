@@ -1180,6 +1180,7 @@ mod shared_asset_tests {
             designcraft_geom::shapes::rectangle(designcraft_geom::Rect::new(0.0, 0.0, 9.0, 9.0)),
         );
         it.content = Content::Graphic(Graphic {
+            layer_options: None,
             asset: sid,
             size: (4.0, 4.0),
             xf: designcraft_geom::Affine::IDENTITY,
@@ -1225,6 +1226,7 @@ mod shared_asset_tests {
             designcraft_geom::shapes::rectangle(designcraft_geom::Rect::new(0.0, 0.0, 9.0, 9.0)),
         );
         it.content = Content::Graphic(Graphic {
+            layer_options: None,
             asset: missing,
             size: (4.0, 4.0),
             xf: designcraft_geom::Affine::IDENTITY,
@@ -1261,6 +1263,7 @@ mod shared_asset_tests {
             designcraft_geom::shapes::rectangle(designcraft_geom::Rect::new(0.0, 0.0, 9.0, 9.0)),
         );
         it.content = Content::Graphic(Graphic {
+            layer_options: None,
             asset: missing,
             size: (4.0, 4.0),
             xf: designcraft_geom::Affine::IDENTITY,

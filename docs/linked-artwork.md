@@ -69,7 +69,7 @@ use Relink to supply their original paths first. A save destination is never the
 Package resolves missing relative references against the source layout before moving the copy,
 so an unrelated file in the package folder cannot replace missing artwork.
 
-Working files that omit linked originals use native format 4. Portable or complete working files
+Format 4 remains reserved for upstream placed-layer capabilities. Working files that omit linked originals use native format 5. Portable or complete working files
 keep the older embedded format even when linked mode is selected. Older applications must ask for an update
 for a format-4 file rather than open it with silently missing artwork. Ordinary embedded files remain
 format 2 (format 3 when retaining EPS originals); opening older files never converts them to external storage automatically.
@@ -77,6 +77,6 @@ format 2 (format 3 when retaining EPS originals); opening older files never conv
 Native format 1 layouts retain their original first-baseline calculations when opened. Saves
 containing this compatibility setting use format 5, including embedded saves, so older readers
 refuse them instead of silently moving text. Current documents without this setting remain
-format 2 (embedded), format 3 (embedded EPS) or format 4 (linked). Changing the first-baseline kind in Text Frame
+format 2 (embedded), format 3 (embedded EPS), format 4 (placed layer options) or format 5 (linked). Changing the first-baseline kind in Text Frame
 Options adopts the current calculation for that frame. Reconfirming the same kind or changing
 unrelated frame options retains compatibility.
