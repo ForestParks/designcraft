@@ -43,7 +43,12 @@ pub const UI_COMMANDS: &[(&str, &str, Option<&str>, &str)] = &[
     ("app.saveSwatches", "Save Swatches for Exchange…", None, "{path?} — write the colour swatches as .ase"),
     ("app.exportPng", "Export Page as PNG…", Some("Cmd+E"), "{}"),
     ("app.exportIdml", "Export IDML…", None, "{path?} — InDesign Markup (IDML) package"),
-    ("app.exportEpub", "Export EPUB…", None, "{path?} — reflowable EPUB 3 (with the first page as its cover)"),
+    (
+        "app.exportEpub",
+        "Export EPUB…",
+        None,
+        "{path?} — reflowable EPUB 3 (with the first page as its cover); without a path, EPUB Export Options (Split Document) and then the save dialog",
+    ),
     (
         "app.exportInteractivePdf",
         "Export PDF (Interactive)…",
@@ -1117,10 +1122,11 @@ fn run_ui_inner(app: &mut DesignApp, id: &str, p: &Value) -> Option<Result<Value
         }
         "app.exportPng" => export_png(app, p),
         "app.exportIdml" => export_idml(app, p),
+        // From the menu, EPUB Export Options first; with a path, straight to the file.
+        "app.exportEpub" if p.get("path").is_some() => export_epub(app, p),
         "app.exportEpub" => {
-            let mut q = if p.is_object() { p.clone() } else { json!({}) };
-            q["cover"] = json!(true);
-            export_bytes(app, &q, "epub", "file.exportEpub")
+            crate::dialogs::open_epub_export(app);
+            Ok(Value::Null)
         }
         "app.exportInteractivePdf" => {
             let mut q = if p.is_object() { p.clone() } else { json!({}) };
@@ -1605,7 +1611,10 @@ fn run_ui_inner(app: &mut DesignApp, id: &str, p: &Value) -> Option<Result<Value
                 Ok(v) => v,
                 Err(e) => return Some(Err(e.to_string())),
             };
-            app.ui.dialog = Some(crate::dialogs::Dialog::new("layerOptions", json!({"layers": layers})));
+            app.ui.dialog = Some(crate::dialogs::Dialog::new(
+                "layerOptions",
+                json!({"useDefaults": !layers.as_array().and_then(|a| a.first()).and_then(|l| l["overridden"].as_bool()).unwrap_or(false), "layers": layers}),
+            ));
             Ok(Value::Null)
         }
         "view.rotateSpread" => {
@@ -2111,6 +2120,16 @@ fn export_idml(app: &mut DesignApp, p: &Value) -> Result<Value, String> {
 
 /// Export EPUB / Text: ask for a path (default extension `ext`), run `cmd` without one and write
 /// what it returns (`base64` or `text`) with the platform writer.
+/// File › Export EPUB…: export through `file.exportEpub` (the first page as its cover) to `path`,
+/// else to a file the user picks.
+pub(crate) fn export_epub(app: &mut DesignApp, p: &Value) -> Result<Value, String> {
+    let mut q = if p.is_object() { p.clone() } else { json!({}) };
+    if let Some(o) = q.as_object_mut() {
+        o.entry("cover").or_insert(json!(true));
+    }
+    export_bytes(app, &q, "epub", "file.exportEpub")
+}
+
 fn export_bytes(app: &mut DesignApp, p: &Value, ext: &str, cmd: &str) -> Result<Value, String> {
     let st = app.session.active().ok_or("no document")?;
     let path = match p.get("path").and_then(Value::as_str) {
@@ -2121,7 +2140,11 @@ fn export_bytes(app: &mut DesignApp, p: &Value, ext: &str, cmd: &str) -> Result<
         }
     };
     let Some(path) = path else { return Ok(Value::Null) };
-    let mut params = json!({});
+    // The caller's options go to the engine command; the path is ours.
+    let mut params = match p {
+        Value::Object(o) => Value::Object(o.iter().filter(|(k, _)| k.as_str() != "path").map(|(k, v)| (k.clone(), v.clone())).collect()),
+        _ => json!({}),
+    };
     if cmd == "file.exportText" {
         let txt = path.to_ascii_lowercase().ends_with(".txt");
         params["format"] = json!(if txt { "txt" } else { "rtf" });
@@ -3350,13 +3373,53 @@ pub fn quick_apply_items(session: &designcraft_engine::Session, query: &str, cjk
     out
 }
 
+/// UI commands search leaves out: they only run with a parameter search can't supply and have no
+/// dialog to ask for it, or without one they reset a setting. Each stays in the menu, panel or
+/// dialog that gives it the value (the workspace menus, Keyboard Shortcuts, Preferences…).
+const NOT_SEARCHED: &[&str] = &[
+    // The workspace to switch to or delete.
+    "window.workspace",
+    "window.deleteWorkspace",
+    // A command and its shortcut, a menu item, a shortcut set; Reset Shortcuts clears every
+    // custom shortcut, and the Keyboard Shortcuts dialog offers it.
+    "window.setShortcut",
+    "window.resetShortcuts",
+    "window.importShortcuts",
+    "window.hideMenuItem",
+    // Without a value these reset the interface to 100% and the dark theme.
+    "window.uiScale",
+    "window.brightness",
+    // A panel, and where it goes.
+    "window.floatPanel",
+    "window.dockPanel",
+    "window.panel.layout",
+    "window.panel.move",
+    "window.panel.float",
+    "window.panel.dock",
+    "window.panel.activate",
+    "window.panel.close",
+    "window.panel.closeGroup",
+    // A window edge, an app page, a recent file, a swatch or color group.
+    "window.resize",
+    "help.app",
+    "app.openRecent",
+    "app.swatchOptionsDialog",
+    "app.colorGroupOptionsDialog",
+    // Without a value these clear the flattener preset, go to Normal screen mode or 100% zoom.
+    "app.flattener",
+    "view.screenMode",
+    "view.zoom",
+    // Where to pin the Contextual Task Bar.
+    "window.taskBarPin",
+];
+
 /// The commands Quick Apply and the application bar's search find: (id, label, default shortcut).
 fn quick_commands() -> impl Iterator<Item = (&'static str, &'static str, Option<&'static str>)> {
     designcraft_engine::command_specs()
         .iter()
         .filter(|c| !c.menu.is_empty() || c.shortcut.is_some())
         .map(|c| (c.id, c.label, c.shortcut))
-        .chain(UI_COMMANDS.iter().map(|c| (c.0, c.1, c.2)))
+        .chain(UI_COMMANDS.iter().filter(|c| !NOT_SEARCHED.contains(&c.0)).map(|c| (c.0, c.1, c.2)))
 }
 
 /// Whether any of `texts` contains the lowercased query (an empty query matches everything).
@@ -5222,6 +5285,104 @@ mod tests {
         assert_eq!(items[0].kind, "Paragraph Style");
         assert!(quick_apply_items(&s, "", false).iter().all(|i| i.kind.is_empty()));
         assert!(quick_apply_items(&s, "preferences", false).iter().any(|i| i.id == "app.preferences"));
+    }
+
+    #[test]
+    fn searched_ui_commands_run_without_parameters_and_keep_preferences() {
+        // Without a value these reset a setting or need a place the test host always has.
+        let searched: Vec<&str> = quick_commands().map(|c| c.0).collect();
+        for id in ["app.flattener", "view.screenMode", "view.zoom", "window.taskBarPin"] {
+            assert!(!searched.contains(&id), "{id} is searched");
+        }
+        // A placed PDF: a graphic with layers.
+        let mut scratch = designcraft_engine::Session::new();
+        scratch.execute("file.new", &json!({})).unwrap();
+        let pdf = scratch.execute("file.exportPdf", &json!({})).unwrap()["base64"].clone();
+        let contexts = ["nothing selected", "text insertion point", "text frame selected", "table cell", "placed PDF selected"];
+        // A two-page document, a saved workspace and non-default preferences, a host with window
+        // controls, and file dialogs that are dismissed.
+        let setup = |context: usize| {
+            let services = crate::Services {
+                pick_open: Some(Box::new(|_| None)),
+                pick_save: Some(Box::new(|_| None)),
+                clipboard_text: Some(Box::new(|| None)),
+                ..Default::default()
+            };
+            let mut app = DesignApp::new(designcraft_engine::Session::new(), services);
+            app.custom_titlebar = true;
+            app.canvas_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0)));
+            app.run("file.new", json!({"pages": 2})).unwrap();
+            app.session.prefs.recent_files.push("/nowhere/recent.dcraft".into());
+            app.ui.shortcuts.insert("view.rulers".into(), "Ctrl+Alt+R".into());
+            app.ui.hidden_menu_items.push("view.guides".into());
+            app.ui.ui_scale = 1.25;
+            app.ui.brightness = crate::theme::Brightness::Light;
+            app.ui.task_bar_at = Some([200.0, 200.0]);
+            run_ui(&mut app, "window.newWorkspace", &json!({"name": "Mine"})).unwrap().unwrap();
+            match context {
+                1 => {
+                    app.run("frame.create", json!({"rect": [72, 72, 400, 400], "content": "text", "text": "One", "caret": true})).unwrap();
+                }
+                2 => {
+                    let f = app.run("frame.create", json!({"rect": [72, 72, 400, 400], "content": "text", "text": "One"})).unwrap()["id"].clone();
+                    app.run("selection.set", json!({"ids": [f]})).unwrap();
+                }
+                3 => {
+                    app.run("frame.create", json!({"rect": [72, 72, 400, 400], "content": "text", "caret": true})).unwrap();
+                    app.run("table.insert", json!({"rows": 2, "cols": 2})).unwrap();
+                }
+                4 => {
+                    let f = app.run("frame.create", json!({"rect": [72, 72, 400, 400]})).unwrap()["id"].clone();
+                    app.run("file.place", json!({"base64": pdf, "name": "a.pdf", "frame": f})).unwrap();
+                    app.run("selection.set", json!({"ids": [f]})).unwrap();
+                }
+                _ => {}
+            }
+            app.ui.dialog = None;
+            app
+        };
+        let prefs = |app: &DesignApp| {
+            let u = &app.ui;
+            json!({
+                "shortcuts": u.shortcuts, "hiddenMenuItems": u.hidden_menu_items, "uiScale": u.ui_scale,
+                "brightness": u.brightness, "workspace": u.workspace, "customWorkspaces": u.custom_workspaces,
+                "docking": u.docking, "dockingHidden": u.docking_hidden, "floating": u.floating,
+            })
+        };
+        let quick = quick_apply_items(&setup(0).session, "workspace", false);
+        assert!(quick.iter().any(|i| i.id == "window.newWorkspace"));
+        // Deleting needs a workspace name: the application bar's workspace menu lists them.
+        assert!(!quick.iter().any(|i| i.id == "window.deleteWorkspace"));
+        // Each command runs as Quick Apply runs an entry. One that needs a selection may fail
+        // without it, but runs in one of the contexts; none changes a preference it wasn't asked to.
+        // Opening a panel changes where the panels are, as it should.
+        let opens_a_panel = ["app.tabsPanel", "app.characterStylesPanel", "app.paragraphStylesPanel"];
+        let arrangement = ["docking", "dockingHidden", "floating"];
+        let mut failed = Vec::new();
+        for (id, ..) in quick_commands().filter(|(id, ..)| UI_COMMANDS.iter().any(|c| c.0 == *id)) {
+            let mut errors = Vec::new();
+            for (i, context) in contexts.iter().enumerate() {
+                let mut app = setup(i);
+                let before = prefs(&app);
+                match app.run(id, json!({})) {
+                    Err(e) => errors.push(format!("{context}: {e}")),
+                    Ok(_) => {
+                        let after = prefs(&app);
+                        let changed: Vec<&String> =
+                            before.as_object().unwrap().iter().filter(|(k, v)| after.get(k.as_str()) != Some(*v)).map(|(k, _)| k).collect();
+                        let changed: Vec<&String> =
+                            changed.into_iter().filter(|k| !(opens_a_panel.contains(&id) && arrangement.contains(&k.as_str()))).collect();
+                        if !changed.is_empty() {
+                            failed.push(format!("{id} ({context}): changed {changed:?}"));
+                        }
+                    }
+                }
+            }
+            if errors.len() == contexts.len() {
+                failed.push(format!("{id}: {errors:?}"));
+            }
+        }
+        assert!(failed.is_empty(), "{failed:#?}");
     }
 
     #[test]

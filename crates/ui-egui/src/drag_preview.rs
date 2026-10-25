@@ -342,6 +342,7 @@ mod tests {
             auto_fit: Default::default(),
             fit_align: 4,
             crop: [10.0, 20.0, 30.0, 40.0],
+            layer_options: None,
         });
         doc.insert_item(SpreadRef::Doc(0), it, None)?;
         Ok((doc, id))
