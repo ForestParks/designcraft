@@ -117,7 +117,7 @@ fn style_row(app: &mut DesignApp, ui: &mut egui::Ui, para: bool, n: &str, curren
     let shown = n.rsplit('/').next().unwrap_or(n);
     let label = if n.contains('/') { shown } else { crate::i18n::style_name(&app.ui.language, shown) };
     let row_label = format!("{label}{}", if current == Some(n) && overridden { "+" } else { "" });
-    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, current == Some(n), &row_label));
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, current == Some(n), &row_label));
     crate::rtl::paint(ui.painter(), row.min + vec2(8.0, 11.0), egui::Align2::LEFT_CENTER, &row_label, egui::FontId::proportional(12.5), t.text);
     let editable = n != if para { designcraft_doc::NO_PARA_STYLE } else { designcraft_doc::NO_CHAR_STYLE };
     if resp.double_clicked() && editable {
@@ -169,7 +169,7 @@ fn style_row(app: &mut DesignApp, ui: &mut egui::Ui, para: bool, n: &str, curren
                     }
                 }
                 ui.separator();
-                let id = egui::Id::new(("new_style_group", para));
+                let id = egui::Id::unique(("new_style_group", para));
                 let mut name: String = ui.data(|d| d.get_temp(id)).unwrap_or_default();
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut name)
@@ -246,7 +246,8 @@ mod tests {
         app.run("style.character.create", json!({"name": "Emphasis", "chars": {"underline": true}})).unwrap();
         app.run("style.character.apply", json!({"name": "Emphasis"})).unwrap();
         app.run("type.char", json!({"fill": "[Paper]"})).unwrap();
-        let mut h = Harness::builder().with_size(vec2(460.0, 300.0)).build_ui_state(|ui, app: &mut DesignApp| paragraph(app, ui), app);
+        let mut h =
+            Harness::builder().allow_missing_glyphs().with_size(vec2(460.0, 300.0)).build_ui_state(|ui, app: &mut DesignApp| paragraph(app, ui), app);
         h.run_steps(3);
         let at = h.get_all_by_label("Header+").next_back().unwrap().rect().center();
         h.event(egui::Event::PointerMoved(at));
@@ -281,7 +282,8 @@ mod tests {
         app.run("type.para", json!({"spaceAfter": 6})).unwrap();
         let a = app.run("type.selectionAttrs", json!({})).unwrap();
         assert_eq!((a["paraOverrides"].as_u64(), a["charOverrides"].as_u64()), (Some(0), Some(0)));
-        let mut h = Harness::builder().with_size(vec2(360.0, 240.0)).build_ui_state(|ui, app: &mut DesignApp| paragraph(app, ui), app);
+        let mut h =
+            Harness::builder().allow_missing_glyphs().with_size(vec2(360.0, 240.0)).build_ui_state(|ui, app: &mut DesignApp| paragraph(app, ui), app);
         h.run_steps(3);
         assert!(h.query_by_label("Body+").is_none());
         assert!(h.query_all_by_label("Body").next().is_some());
@@ -298,7 +300,7 @@ mod tests {
         let undo_len = app.session.doc().unwrap().history.undo.len();
         let mut h = Harness::builder().with_size(vec2(360.0, 240.0)).build_ui_state(
             |ui, app: &mut DesignApp| {
-                let id = egui::Id::new("test_fonts");
+                let id = egui::Id::unique("test_fonts");
                 if ui.data(|d| d.get_temp::<bool>(id)).is_none() {
                     crate::theme::install_fonts(ui.ctx(), "");
                     ui.data_mut(|d| d.insert_temp(id, true));
