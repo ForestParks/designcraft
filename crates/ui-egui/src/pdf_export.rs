@@ -122,7 +122,7 @@ impl Export {
     pub fn show(&mut self, ctx: &egui::Context) {
         if !self.busy() {
             if self.notice {
-                egui::Modal::new(egui::Id::new("pdf-export-result")).show(ctx, |ui| {
+                egui::Modal::new(egui::Id::unique("pdf-export-result")).show(ctx, |ui| {
                     ui.set_max_width(520.0);
                     if let Some(last) = &self.last {
                         if let Some(error) = last["error"].as_str() {
@@ -148,7 +148,7 @@ impl Export {
             }
             return;
         }
-        egui::Modal::new(egui::Id::new("pdf-export-progress")).show(ctx, |ui| {
+        egui::Modal::new(egui::Id::unique("pdf-export-progress")).show(ctx, |ui| {
             ui.set_max_width(520.0);
             ui.heading("Exporting PDF…");
             ui.label(&self.path);
@@ -297,7 +297,10 @@ mod tests {
         if close {
             raw.viewports.entry(egui::ViewportId::ROOT).or_default().events.push(egui::ViewportEvent::Close);
         }
-        let mut out = ctx.run_ui(raw, |ui| app.logic(ui.ctx()));
+        let mut out = ctx.run_ui(raw, |ui| {
+            app.logic(ui.ctx());
+            app.ui(ui);
+        });
         out.textures_delta.clear();
         out.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.commands.clone()).unwrap_or_default()
     }
@@ -342,13 +345,49 @@ mod tests {
     }
 
     #[test]
+    fn pdf_export_defers_floating_window_drops_until_terminal_result() {
+        #[derive(Debug)]
+        struct DroppedDocument(std::path::PathBuf);
+        impl egui::DroppedFile for DroppedDocument {
+            fn path(&self) -> &std::path::Path {
+                &self.0
+            }
+            fn bytes(&self) -> Result<Vec<u8>, String> {
+                std::fs::read(&self.0).map_err(|error| error.to_string())
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("floating.designcraft");
+        let mut saved = designcraft_engine::Session::new();
+        saved.execute("file.new", &json!({})).unwrap();
+        saved.execute("file.save", &json!({"path":path})).unwrap();
+        let (tx, rx) = mpsc::sync_channel(1);
+        app.pdf_export.pending = Some(rx);
+        app.open_dropped_files(&[Arc::new(DroppedDocument(path)) as egui::DroppedFileHandle], None);
+        for _ in 0..3 {
+            logic_frame(&mut app, &ctx, false);
+            assert_eq!(app.session.documents().len(), 1, "export must defer the floating-window drop");
+            assert_eq!(app.pending_drops.len(), 1);
+        }
+        tx.send(Err("synthetic export failure".into())).unwrap();
+        logic_frame(&mut app, &ctx, false);
+        assert_eq!(app.session.documents().len(), 2, "the dropped document opens after the terminal result");
+        assert!(app.pending_drops.is_empty());
+        logic_frame(&mut app, &ctx, false);
+        assert_eq!(app.session.documents().len(), 2, "the drop is delivered exactly once");
+    }
+
+    #[test]
     fn pdf_export_replays_dropped_graphics_at_the_original_pointer() {
         let ctx = egui::Context::default();
         let mut app = ready_app(&ctx).unwrap();
-        app.canvas_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0)));
         *app.view_mut().unwrap() = crate::View { zoom: 1.0, origin: designcraft_geom::Point::ZERO, fitted: true, rotation: 0 };
-        let pointer = Some(egui::pos2(25.0, 35.0));
-        let (_, expected) = crate::canvas::drop_point(&app, pointer).unwrap();
+        let canvas = app.canvas_rect.expect("the ready UI has a canvas");
+        let drop_position = canvas.min + egui::vec2(25.0, 35.0);
+        assert!(canvas.contains(drop_position), "exercise a real canvas drop, not the center fallback");
+        let pointer = Some(drop_position);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("placed.svg");
         std::fs::write(
@@ -358,13 +397,14 @@ mod tests {
         .unwrap();
         let (tx, rx) = mpsc::sync_channel(1);
         app.pdf_export.pending = Some(rx);
-        app.deferred_drops.push((path.to_string_lossy().into_owned(), pointer));
+        app.pending_drops.push(crate::PendingDrop { path: path.to_string_lossy().into_owned(), pointer, generation: app.input_generation() });
         logic_frame(&mut app, &ctx, false);
-        assert_eq!(app.deferred_drops.len(), 1);
+        assert_eq!(app.pending_drops.len(), 1);
         assert!(app.session.doc().unwrap().doc.spreads[0].items.is_empty());
+        let (_, expected) = crate::canvas::drop_point(&app, pointer).unwrap();
         tx.send(Err("synthetic export failure".into())).unwrap();
         logic_frame(&mut app, &ctx, false);
-        assert!(app.deferred_drops.is_empty());
+        assert!(app.pending_drops.is_empty());
         assert_eq!(app.session.documents().len(), 1, "a graphic must be placed, not opened as a document");
         let items = &app.session.doc().unwrap().doc.spreads[0].items;
         assert_eq!(items.len(), 1);
