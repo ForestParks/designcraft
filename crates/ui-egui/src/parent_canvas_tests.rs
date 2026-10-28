@@ -1,4 +1,4 @@
-use super::*;
+use super::{CanvasLayout, Color32, DesignApp, Point, Pos2, Rect, View, Xf, json, render_texture, vec2};
 
 fn app_with_document_object() -> DesignApp {
     let mut app = DesignApp::new(designcraft_engine::Session::new(), crate::Services::default());
@@ -105,13 +105,12 @@ fn small_edits_in_the_same_canvas_mode_still_repaint_partially() {
 
 /// Compare actual partial texture uploads with a clean full render of the edited document.
 #[test]
-fn partial_edits_keep_proof_colors_and_ink_limit_identical_to_full_redraws() {
-    for (proof, ink_limit) in [(true, None), (false, Some(0.1)), (true, Some(0.1))] {
+fn partial_edits_keep_proof_colors_identical_to_full_redraws() {
+    for proof in [false, true] {
         let mut app = app_with_document_object();
         app.run("swatch.create", json!({"name":"Test red", "color":"#e61a33"})).unwrap();
         app.ui.proof_colors = proof;
         app.ui.proof_setup.target = designcraft_color::cms::ProofTarget::Protanopia;
-        app.ui.ink_limit = ink_limit;
         let ctx = egui::Context::default();
         let _ = render(&mut app, &ctx);
         app.run("object.fill", json!({"swatch":"Test red"})).unwrap();
@@ -123,7 +122,9 @@ fn partial_edits_keep_proof_colors_and_ink_limit_identical_to_full_redraws() {
         // Drop only the cached view, keeping the same document and colour options.
         app.canvas.shown = None;
         let full = render(&mut app, &ctx);
-        assert_eq!(patched, pixel(&full, app.canvas.shown.unwrap(), point), "proof={proof}, ink={ink_limit:?}");
-        assert_ne!(patched, Color32::from_rgb(230, 26, 51), "the display transform must affect the new colour");
+        assert_eq!(patched, pixel(&full, app.canvas.shown.unwrap(), point), "proof={proof}");
+        if proof {
+            assert_ne!(patched, Color32::from_rgb(230, 26, 51), "the display transform must affect the new colour");
+        }
     }
 }

@@ -52,6 +52,13 @@ fn renderer_tag() -> &'static str {
         let mut hash = Sha256::new();
         for source in [
             include_bytes!("lib.rs").as_slice(),
+            include_bytes!("color.rs").as_slice(),
+            include_bytes!("decode.rs").as_slice(),
+            include_bytes!("draw.rs").as_slice(),
+            include_bytes!("driver.rs").as_slice(),
+            include_bytes!("types.rs").as_slice(),
+            include_bytes!("pdf_raster.rs").as_slice(),
+            include_bytes!("blendspace.rs").as_slice(),
             include_bytes!("images.rs").as_slice(),
             include_bytes!("preview_disk.rs").as_slice(),
             include_bytes!("../../../Cargo.lock").as_slice(),

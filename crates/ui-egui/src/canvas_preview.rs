@@ -17,7 +17,8 @@ pub(crate) struct Settings {
     pub parents: bool,
     pub colors: Option<designcraft_color::cms::ColorSettings>,
     pub proof: Option<designcraft_color::cms::ProofSetup>,
-    pub ink_limit: Option<f32>,
+    /// The print separations overlay owns ink visualization; composite previews stay hidden.
+    pub separations: bool,
 }
 impl Settings {
     pub fn coarse(mut self) -> Self {
@@ -65,9 +66,6 @@ fn render(job: Job) -> Done {
         }
         if let Some(proof) = &job.settings.proof {
             designcraft_render::proof_view(&mut image, proof);
-        }
-        if job.settings.options.plate.is_none() && job.settings.ink_limit.is_some() {
-            designcraft_render::separation_view(&mut image, None, job.settings.ink_limit);
         }
         Some(image)
     });
@@ -181,6 +179,9 @@ impl Previews {
     }
 
     pub fn get(&mut self, spread: SpreadRef) -> Option<egui::TextureHandle> {
+        if self.settings.as_ref().is_some_and(|s| s.separations) {
+            return None;
+        }
         let (texture, stamp) = self.textures.get_mut(&spread)?;
         self.clock = self.clock.wrapping_add(1);
         *stamp = self.clock;
@@ -190,7 +191,7 @@ impl Previews {
 
     /// Caller orders candidates by current viewport priority each frame; no navigation backlog.
     pub fn request(&mut self, slots: impl IntoIterator<Item = SpreadSlot>, cache: Arc<designcraft_compose::Cache>, ctx: &egui::Context) {
-        if self.pending {
+        if self.pending || self.settings.as_ref().is_some_and(|s| s.separations) {
             return;
         }
         let Some(slot) = slots.into_iter().find(|s| !self.textures.contains_key(&s.spread) && !self.failed.contains(&s.spread)) else { return };
@@ -224,7 +225,7 @@ mod tests {
         app.run("file.new", serde_json::json!({"width": 64, "height": 64, "pages": 3, "facingPages": false})).unwrap();
         app.run("frame.create", serde_json::json!({"rect": [8, 8, 56, 56], "content": "unassigned"})).unwrap();
         app.run("object.fill", serde_json::json!({"swatch": "[Black]"})).unwrap();
-        let settings = Settings { options: RenderOptions::default(), parents: false, colors: None, proof: None, ink_limit: None }.coarse();
+        let settings = Settings { options: RenderOptions::default(), parents: false, colors: None, proof: None, separations: false }.coarse();
         (app, egui::Context::default(), settings)
     }
 
@@ -270,7 +271,7 @@ mod tests {
         for next in [
             Settings { parents: true, ..settings.clone() },
             Settings { proof: Some(Default::default()), ..settings.clone() },
-            Settings { ink_limit: Some(240.0), ..settings.clone() },
+            Settings { separations: true, ..settings.clone() },
             Settings { options: RenderOptions { plate: Some(0), ..settings.options.clone() }, ..settings.clone() },
         ] {
             let old = previews.generation;
@@ -281,6 +282,23 @@ mod tests {
         previews.clear();
         previews.accept(done(previews.generation, SpreadRef::Doc(0)), &ctx);
         assert!(previews.textures.is_empty(), "closing a document must not restore its pixels");
+    }
+
+    #[test]
+    fn composite_scroll_previews_yield_to_print_separations() {
+        let (app, ctx, settings) = fixture();
+        let mut previews = Previews::default();
+        begin(&mut previews, &app, settings.clone(), &ctx);
+        previews.accept(done(previews.generation, SpreadRef::Doc(0)), &ctx);
+        assert!(previews.get(SpreadRef::Doc(0)).is_some());
+        begin(&mut previews, &app, Settings { separations: true, ..settings }, &ctx);
+        let rendered = previews.rendered;
+        let layout = CanvasLayout::new(&app.session.active().unwrap().doc, false);
+        previews.request(layout.slots, app.session.cache.clone(), &ctx);
+        assert!(!previews.pending, "the print preview must own the next ink render");
+        assert_eq!(previews.rendered, rendered);
+        assert!(previews.textures.is_empty());
+        assert!(previews.get(SpreadRef::Doc(0)).is_none());
     }
 
     #[test]
